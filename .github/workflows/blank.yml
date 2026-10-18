@@ -65,6 +65,8 @@ env:
   PANEL_ADMIN_PASSWORD: ${{ secrets.PANEL_ADMIN_PASSWORD }}
   # --- Minecraft RCON (Telegram /cmd isi se console me jata hai) ---
   MC_RCON_PASSWORD: ${{ secrets.MC_RCON_PASSWORD }}
+  # --- Playit (public join ke liye; Panel hamesha Tailscale par rahega) ---
+  PLAYIT_SECRET_KEY: ${{ secrets.PLAYIT_SECRET_KEY }}
   # --- 24/7 auto-restart on/off: Repo Settings > Secrets and variables >
   #     Actions > Variables me AUTO_RESTART = true / false banao.
   #     Variable nahi banaya to default TRUE mana jayega. ---
