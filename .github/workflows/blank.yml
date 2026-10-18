@@ -1,0 +1,1028 @@
+name: 🎮 Minecraft 24-7 Persistent Server (Pterodactyl + Telegram)
+
+# ============================================================================
+# KYA HAI YE?
+# Aapke purane "Continuous Persistent VPS (Windows)" workflow ka Minecraft
+# version — scratch se banaya gaya:
+#   Windows/Dockur   -> Minecraft (Paper) + Pterodactyl Panel + Wings
+#   RDP (3389)       -> Minecraft (25565) + Panel (8080, browser)
+#   Telegram bot     -> Telegram bot 2.0 (/manage, /cmd, /players, /backup...)
+#   Drive backup     -> 1) Hourly FULL backup (server band kiye bina)
+#                       2) LIVE backup (har change ~15-30 sec me Drive par)
+#                       3) Final emergency backup (timeout/error se pehle)
+#   Auto-restart     -> 5h30m par backup -> khud naya workflow start -> restore
+#
+# SABSE PEHLE README.md PADHO — Secrets aur first-run Panel steps wahi hain.
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_mode:
+        description: "Server kis mode me chale?"
+        type: choice
+        default: pterodactyl
+        options:
+          - pterodactyl   # Panel se manage hoga (first run me 5-min one-time Node/Server setup)
+          - direct        # Panel install hoga, lekin Minecraft seedha Docker se (zero setup, instant play)
+      mc_type:
+        description: "Minecraft server type (sirf direct mode me use hota hai)"
+        type: choice
+        default: PAPER
+        options: [PAPER, VANILLA, PURPUR, SPIGOT]
+      mc_version:
+        description: "Minecraft version (direct mode)"
+        required: true
+        default: "LATEST"
+      mc_memory:
+        description: "Minecraft RAM (direct mode) — private repo (8GB RAM) par 3G rakho"
+        required: true
+        default: "5G"
+      ops:
+        description: "Server OP username(s), comma separated"
+        required: true
+        default: "RootBlastgaming"
+
+concurrency:
+  group: minecraft-session
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  # --- Google Drive (rclone, aapke purane workflow jaisa hi) ---
+  RCLONE_CONFIG_GDRIVE_TYPE: drive
+  RCLONE_CONFIG_GDRIVE_SCOPE: drive
+  RCLONE_CONFIG_GDRIVE_TOKEN: ${{ secrets.RCLONE_DRIVE_TOKEN }}
+  # --- Telegram ---
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  # --- Panel admin (first run par auto-create hoga) ---
+  PANEL_ADMIN_EMAIL: ${{ secrets.PANEL_ADMIN_EMAIL }}
+  PANEL_ADMIN_USERNAME: ${{ secrets.PANEL_ADMIN_USERNAME }}
+  PANEL_ADMIN_PASSWORD: ${{ secrets.PANEL_ADMIN_PASSWORD }}
+  # --- Minecraft RCON (Telegram /cmd isi se console me jata hai) ---
+  MC_RCON_PASSWORD: ${{ secrets.MC_RCON_PASSWORD }}
+  # --- 24/7 auto-restart on/off: Repo Settings > Secrets and variables >
+  #     Actions > Variables me AUTO_RESTART = true / false banao.
+  #     Variable nahi banaya to default TRUE mana jayega. ---
+  AUTO_RESTART: ${{ vars.AUTO_RESTART }}
+  GH_TOKEN: ${{ github.token }}
+  TZ: Asia/Kolkata
+  WORKFLOW_FILE: minecraft-server.yml
+
+jobs:
+  minecraft:
+    name: 🖥️ Minecraft Session
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+
+      # ============================================================
+      # STEP 1: CHECKOUT REPO (purane code me ye sirf naam ka tha,
+      #         asli actions/checkout gayab tha — yahan fix hai)
+      # ============================================================
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 📣 Session Start Message
+        run: |
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${NOW} : 🙏 Namaste Sir! Minecraft workflow start ho gaya hai. Step 1 (Checkout) complete. Ab disk saaf karke tools setup kar rahe hain..." > /dev/null || true
+          date +%s > /tmp/session_start_epoch
+          echo "Session started at $(date)"
+
+      # ============================================================
+      # STEP 1.5: MAXIMIZE DISK SPACE
+      # ============================================================
+      - name: 🗑️ Maximize Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
+          [ -n "$AGENT_TOOLSDIRECTORY" ] && sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo apt-get clean
+          echo "Disk space after cleanup:"; df -h /
+
+      # ============================================================
+      # STEP 2: SETUP TOOLS + SAARI HELPER SCRIPTS
+      # (rclone progress, RCON client, backup engine, live-sync,
+      #  wings watcher — sab yahi bante hain, baad wale steps use karte hain)
+      # ============================================================
+      - name: 🛠️ Setup Tools & Helper Scripts
+        run: |
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ⚙️ Step 2 (Setup Tools): tmux, zstd, inotify-tools aur rclone install ho rahe hain..." > /dev/null || true
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tmux python3 curl unzip net-tools neofetch iproute2 xxd jq util-linux zstd inotify-tools > /dev/null
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+          # ---------- rclone progress uploader (purane code se, improved) ----------
+          cat << 'EOF' | sudo tee /usr/local/bin/rclone_progress.sh >/dev/null
+          #!/bin/bash
+          SRC="$1"; DST="$2"; MSG="$3"
+          LOG="/tmp/rclone_run.log"; rm -f "$LOG"
+          rclone copyto "$SRC" "$DST" --ignore-times --stats 5s --stats-one-line > "$LOG" 2>&1 &
+          PID=$!; LAST_PCT=0
+          while kill -0 $PID 2>/dev/null; do
+            sleep 5
+            LINE=$(grep "ETA" "$LOG" | tail -1 || true)
+            PCT=$(echo "$LINE" | grep -oE '[0-9]+%' | tail -1 | tr -d '%' || true)
+            ETA=$(echo "$LINE" | grep -oE 'ETA [0-9a-zA-Z:]+' | tail -1 || echo "ETA calculating...")
+            if [[ "$PCT" =~ ^[0-9]+$ ]] && [ "$PCT" -ge $((LAST_PCT + 10)) ] && [ "$PCT" -lt 100 ]; then
+              NOW=$(date '+%I:%M:%S %p')
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ⏳ Sir, ${MSG} : ${PCT}% complete! (${ETA})" > /dev/null || true
+              LAST_PCT=$((PCT / 10 * 10))
+            fi
+          done
+          wait $PID; exit $?
+          EOF
+
+          # ---------- common helpers : Minecraft data dir + container dhoondhna ----------
+          cat << 'EOF' | sudo tee /usr/local/bin/mc_common.sh >/dev/null
+          #!/bin/bash
+          # Minecraft ka data folder kahan hai? (direct mode ya pterodactyl volume)
+          mc_data_dir() {
+            if [ -f /opt/minecraft/data/server.properties ]; then echo "/opt/minecraft/data"; return 0; fi
+            local d
+            for d in /var/lib/pterodactyl/volumes/*/; do
+              [ -f "${d}server.properties" ] && { echo "${d%/}"; return 0; }
+            done
+            d=$(ls -d /var/lib/pterodactyl/volumes/*/ 2>/dev/null | head -1 || true)
+            [ -n "$d" ] && echo "${d%/}" && return 0
+            return 1
+          }
+          # Minecraft container ka naam/ID (direct = "minecraft", wings = server UUID)
+          mc_container() {
+            local id mounts name
+            for id in $(docker ps -a --format '{{.ID}}' 2>/dev/null); do
+              name=$(docker inspect -f '{{.Name}}' "$id" 2>/dev/null | tr -d '/')
+              mounts=$(docker inspect -f '{{range .Mounts}}{{.Source}} {{end}}' "$id" 2>/dev/null)
+              if [ "$name" = "minecraft" ] || echo "$mounts" | grep -qE 'pterodactyl/volumes|/opt/minecraft/data'; then
+                echo "$name"; return 0
+              fi
+            done
+            return 1
+          }
+          notify_telegram() {
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=$(date '+%I:%M:%S %p') : $1" > /dev/null || true
+          }
+          EOF
+
+          # ---------- RCON client (python stdlib only, koi pip nahi) ----------
+          cat << 'PYEOF' > /tmp/rcon.py
+          import socket, struct, subprocess, sys
+
+          def mc_container_ip():
+              try:
+                  ids = subprocess.check_output(["docker", "ps", "-q"], text=True).split()
+              except Exception:
+                  return "127.0.0.1"
+              for cid in ids:
+                  try:
+                      mounts = subprocess.check_output(["docker", "inspect", "-f",
+                          "{{range .Mounts}}{{.Source}} {{end}}", cid], text=True)
+                      name = subprocess.check_output(["docker", "inspect", "-f", "{{.Name}}", cid], text=True).strip("/")
+                      if name == "minecraft" or "pterodactyl/volumes" in mounts or "/opt/minecraft/data" in mounts:
+                          ip = subprocess.check_output(["docker", "inspect", "-f",
+                              "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", cid], text=True).split()
+                          if ip: return ip[0]
+                  except Exception:
+                      continue
+              return "127.0.0.1"
+
+          def rcon(command, password, host=None, port=25575, timeout=8):
+              host = host or mc_container_ip()
+              with socket.create_connection((host, port), timeout=timeout) as s:
+                  def send(pid, ptype, body):
+                      data = struct.pack("<ii", pid, ptype) + body.encode() + b"\x00\x00"
+                      s.sendall(struct.pack("<i", len(data)) + data)
+                  def recv():
+                      raw = s.recv(4)
+                      if len(raw) < 4: raise ConnectionError("rcon closed")
+                      (length,) = struct.unpack("<i", raw)
+                      data = b""
+                      while len(data) < length:
+                          chunk = s.recv(length - len(data))
+                          if not chunk: break
+                          data += chunk
+                      pid, ptype = struct.unpack("<ii", data[:8])
+                      return pid, data[8:-2].decode("utf-8", "replace")
+                  send(1, 3, password)          # login
+                  pid, _ = recv()
+                  if pid == -1: raise PermissionError("RCON password galat hai")
+                  send(2, 2, command)           # command
+                  _, out = recv()
+                  return out.strip()
+
+          if __name__ == "__main__":
+              import os
+              cmd = " ".join(sys.argv[1:])
+              try:
+                  print(rcon(cmd, os.environ.get("MC_RCON_PASSWORD", "")))
+              except Exception as e:
+                  print(f"RCON_ERROR: {e}", file=sys.stderr); sys.exit(1)
+          PYEOF
+
+          # ---------- BACKUP ENGINE (hourly + final + handover, teeno yahi use karte hain) ----------
+          cat << 'EOF' | sudo tee /usr/local/bin/mc_backup.sh >/dev/null
+          #!/bin/bash
+          # Usage: mc_backup.sh "Reason text"
+          source /usr/local/bin/mc_common.sh
+          REASON="${1:-Manual}"
+          notify_telegram "💾 Sir, FULL backup shuru! Reason: ${REASON}. Minecraft BAND NAHI hoga — sirf 5-10 sec world-save pause hoga."
+
+          # 1) Chhota Tailscale backup (agla workflow sabse pehle yahi restore karta hai)
+          if [ -d /var/lib/tailscale ]; then
+            sudo tar -czf /tmp/tailscale-state.tar.gz -C /var/lib tailscale 2>/dev/null || true
+            rclone copyto /tmp/tailscale-state.tar.gz gdrive:tailscale-state.tar.gz --ignore-times 2>/dev/null || true
+          fi
+
+          # 2) World ko safely freeze karo (players online rahenge, sirf likhna rukega)
+          python3 /tmp/rcon.py "save-off" >/dev/null 2>&1 || true
+          python3 /tmp/rcon.py "save-all flush" >/dev/null 2>&1 || true
+          sleep 3
+
+          # 3) Panel DB ko band karke tar lo (DB corruption rokne ke liye;
+          #    Minecraft/Wings isse affect NAHI hote)
+          if [ -f /opt/pterodactyl/docker-compose.yml ]; then
+            (cd /opt/pterodactyl && sudo docker compose stop panel database >/dev/null 2>&1) || true
+          fi
+
+          PATHS=()
+          for p in opt/pterodactyl opt/minecraft etc/pterodactyl var/lib/pterodactyl var/lib/tailscale; do
+            [ -e "/$p" ] && PATHS+=("$p")
+          done
+
+          OK=1
+          sudo rm -f /tmp/minecraft-backup.tar.zst
+          if [ ${#PATHS[@]} -gt 0 ]; then
+            sudo tar --sparse --warning=no-file-changed \
+              --exclude='opt/pterodactyl/logs/*' --exclude='var/lib/pterodactyl/logs/*' \
+              -I 'zstd -T0 -3' -cf /tmp/minecraft-backup.tar.zst -C / "${PATHS[@]}" 2>/dev/null || OK=0
+          else
+            OK=0
+          fi
+
+          # 4) Sab wapas chalu
+          if [ -f /opt/pterodactyl/docker-compose.yml ]; then
+            (cd /opt/pterodactyl && sudo docker compose up -d database panel >/dev/null 2>&1) || true
+          fi
+          python3 /tmp/rcon.py "save-on" >/dev/null 2>&1 || true
+
+          if [ "$OK" = "1" ]; then
+            notify_telegram "✅ Sir, backup ban gaya! Ab Google Drive par upload ho raha hai..."
+            if /usr/local/bin/rclone_progress.sh "/tmp/minecraft-backup.tar.zst" "gdrive:minecraft-backup.tar.zst.tmp" "Uploading FULL Backup"; then
+              rclone moveto "gdrive:minecraft-backup.tar.zst.tmp" "gdrive:minecraft-backup.tar.zst" 2>/dev/null || true
+              rclone cleanup gdrive: 2>/dev/null || true
+              notify_telegram "🎉 Sir, FULL backup Drive par safe hai! (gdrive:minecraft-backup.tar.zst)"
+              touch /tmp/skip_final_backup
+              exit 0
+            fi
+          fi
+          notify_telegram "❌ Sir, FULL backup me error aaya! Log: workflow ka 'Main Loop' step dekho."
+          exit 1
+          EOF
+
+          # ---------- LIVE BACKUP (har change ke ~15-30 sec ke andar Drive par) ----------
+          cat << 'EOF' | sudo tee /usr/local/bin/live_sync.sh >/dev/null
+          #!/bin/bash
+          # Sach: "har 1 second" full upload Drive API par possible nahi aur
+          # world corrupt karega. Ye uska sahi version hai: file change detect
+          # (inotify) -> 15 sec debounce -> sirf BADLI hui files upload (rclone
+          # incremental). Matlab jo block tootta/banta hai, seconds me Drive par.
+          source /usr/local/bin/mc_common.sh
+          echo "[live] live backup watcher started" >> /tmp/live_sync.log
+          while true; do
+            DIR=$(mc_data_dir 2>/dev/null || true)
+            if [ -z "$DIR" ] || [ ! -d "$DIR" ]; then sleep 20; continue; fi
+            timeout 60 inotifywait -r -q -e close_write,create,delete,move \
+              --exclude '(/logs/|/cache/|\.log$|session\.lock)' "$DIR" >/dev/null 2>&1 || true
+            sleep 15
+            flock -n /tmp/live_sync.lock rclone copy "$DIR" "gdrive:minecraft-live-backup/current" \
+              --exclude "logs/**" --exclude "cache/**" --exclude "libraries/**" \
+              --exclude "versions/**" --exclude "*.jar" --exclude "session.lock" \
+              --fast-list --transfers 4 --checkers 8 --retries 2 \
+              --timeout 60s --contimeout 30s >> /tmp/live_sync.log 2>&1 || true
+          done
+          EOF
+
+          # ---------- WINGS WATCHER (config milte hi Wings start,
+          #            server volume milte hi RCON auto-enable + live-restore) ----------
+          cat << 'EOF' | sudo tee /usr/local/bin/wings_watcher.sh >/dev/null
+          #!/bin/bash
+          source /usr/local/bin/mc_common.sh
+          while true; do
+            # Wings start (sirf jab panel se config.yml aa jaye)
+            if [ -f /etc/pterodactyl/config.yml ] && ! pgrep -x wings >/dev/null 2>&1; then
+              sudo mkdir -p /var/lib/pterodactyl /var/log/pterodactyl /tmp/pterodactyl
+              (sudo nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml > /tmp/wings.log 2>&1 &)
+              notify_telegram "🪽 Sir, Wings daemon start ho gaya hai! Ab Panel se server Create/Start kar sakte hain."
+              sleep 10
+            fi
+            # Naya Minecraft server volume mila? RCON on kar do (Telegram /cmd ke liye)
+            DIR=$(mc_data_dir 2>/dev/null || true)
+            if [ -n "$DIR" ] && [ -f "$DIR/server.properties" ]; then
+              if ! grep -q "^rcon.password=${MC_RCON_PASSWORD}$" "$DIR/server.properties" 2>/dev/null; then
+                sed -i "s/^enable-rcon=.*/enable-rcon=true/" "$DIR/server.properties" 2>/dev/null || echo "enable-rcon=true" >> "$DIR/server.properties"
+                grep -q "^rcon.port=" "$DIR/server.properties" && sed -i "s/^rcon.port=.*/rcon.port=25575/" "$DIR/server.properties" || echo "rcon.port=25575" >> "$DIR/server.properties"
+                grep -q "^rcon.password=" "$DIR/server.properties" && sed -i "s|^rcon.password=.*|rcon.password=${MC_RCON_PASSWORD}|" "$DIR/server.properties" || echo "rcon.password=${MC_RCON_PASSWORD}" >> "$DIR/server.properties"
+                if [ ! -f /tmp/rcon_notified ]; then
+                  notify_telegram "🔌 Sir, server me RCON auto-enable ho gaya hai. Agar server chal raha tha to ek baar Panel/Telegram se RESTART kar do — phir /cmd kaam karega."
+                  touch /tmp/rcon_notified
+                fi
+              fi
+              # Pehli baar volume mila aur Drive par LIVE backup hai to
+              # sabse fresh world wapas bhar do (hourly backup se naya data)
+              if [ ! -f /tmp/live_restored ] && rclone lsf "gdrive:minecraft-live-backup/current" >/dev/null 2>&1; then
+                C=$(mc_container 2>/dev/null || true)
+                [ -n "$C" ] && docker stop "$C" >/dev/null 2>&1 || true
+                rclone copy "gdrive:minecraft-live-backup/current" "$DIR" --update \
+                  --exclude "logs/**" --exclude "cache/**" >> /tmp/live_sync.log 2>&1 || true
+                touch /tmp/live_restored
+                notify_telegram "♻️ Sir, LIVE backup se sabse fresh world restore ho gaya hai. Ab Panel/Telegram se server START kar do."
+              fi
+            fi
+            sleep 20
+          done
+          EOF
+
+          sudo chmod +x /usr/local/bin/rclone_progress.sh /usr/local/bin/mc_backup.sh \
+                        /usr/local/bin/live_sync.sh /usr/local/bin/wings_watcher.sh
+          echo "Tools & scripts ready."
+
+      # ============================================================
+      # STEP 3: TELEGRAM BOT (purane listener ka full upgrade)
+      # Secrets ab code me hardcode NAHI hote (purane code me token
+      # /tmp file me saaf likha tha) — bot environment se padhta hai.
+      # ============================================================
+      - name: 🤖 Start Telegram Bot (/manage, /cmd, /players...)
+        run: |
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🤖 Step 3: Telegram bot active ho raha hai. Thodi der me /start bhej kar dekho Sir!" > /dev/null || true
+
+          cat << 'PYEOF' > /tmp/telegram_bot.py
+          import json, os, re, shutil, socket, struct, subprocess, time, urllib.request, urllib.parse
+
+          BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          CHAT_ID   = str(os.environ.get("TELEGRAM_CHAT_ID", ""))
+          GH_TOKEN  = os.environ.get("GH_TOKEN", "")
+          REPO      = os.environ.get("GITHUB_REPOSITORY", "")
+          RUN_ID    = os.environ.get("GITHUB_RUN_ID", "")
+          WF_FILE   = os.environ.get("WORKFLOW_FILE", "minecraft-server.yml")
+          RCON_PASS = os.environ.get("MC_RCON_PASSWORD", "")
+          API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+          ACTION_FILE = "/tmp/telegram_action"
+
+          # ---------------- Telegram API helpers ----------------
+          def api_call(method, params=None):
+              url = f"{API}/{method}"
+              data = urllib.parse.urlencode(params or {}).encode() if params else None
+              try:
+                  with urllib.request.urlopen(url, data=data, timeout=20) as r:
+                      return json.loads(r.read().decode())
+              except Exception:
+                  return None
+
+          def send(text, markup=None):
+              p = {"chat_id": CHAT_ID, "text": str(text)[:3900]}
+              if markup: p["reply_markup"] = json.dumps(markup)
+              api_call("sendMessage", p)
+
+          def now(): return time.strftime("%I:%M:%S %p")
+
+          # ---------------- Docker / Minecraft helpers ----------------
+          def sh(cmd, timeout=15):
+              try:
+                  return subprocess.check_output(cmd, shell=True, text=True, timeout=timeout, stderr=subprocess.DEVNULL).strip()
+              except Exception:
+                  return ""
+
+          def mc_container():
+              for cid in sh("docker ps -a --format '{{.ID}}'").split("\n"):
+                  if not cid: continue
+                  name = sh(f"docker inspect -f '{{{{.Name}}}}' {cid}").strip("/")
+                  mounts = sh(f"docker inspect -f '{{{{range .Mounts}}}}{{{{.Source}}}} {{{{end}}}}' {cid}")
+                  if name == "minecraft" or "pterodactyl/volumes" in mounts or "/opt/minecraft/data" in mounts:
+                      return name
+              return ""
+
+          def mc_ip():
+              c = mc_container()
+              if not c: return "127.0.0.1"
+              ip = sh(f"docker inspect -f '{{{{range .NetworkSettings.Networks}}}}{{{{.IPAddress}}}} {{{{end}}}}' {c}").split()
+              return ip[0] if ip else "127.0.0.1"
+
+          def rcon(command, timeout=8):
+              with socket.create_connection((mc_ip(), 25575), timeout=timeout) as s:
+                  def send(pid, ptype, body):
+                      d = struct.pack("<ii", pid, ptype) + body.encode() + b"\x00\x00"
+                      s.sendall(struct.pack("<i", len(d)) + d)
+                  def recv():
+                      raw = s.recv(4)
+                      (length,) = struct.unpack("<i", raw)
+                      data = b""
+                      while len(data) < length:
+                          ch = s.recv(length - len(data))
+                          if not ch: break
+                          data += ch
+                      pid, _ = struct.unpack("<ii", data[:8])
+                      return pid, data[8:-2].decode("utf-8", "replace")
+                  send(1, 3, RCON_PASS)
+                  pid, _ = recv()
+                  if pid == -1: raise PermissionError("RCON password mismatch")
+                  send(2, 2, command)
+                  _, out = recv()
+                  return out.strip() or "(koi output nahi)"
+
+          def rcon_safe(cmd):
+              try: return rcon(cmd)
+              except Exception as e: return f"⚠️ Server offline hai ya RCON ready nahi ({e}). Pehle server START karo."
+
+          def tailscale_ip():
+              return sh("tailscale ip -4") or "not-available"
+
+          def players():
+              out = rcon_safe("list")
+              m = re.search(r"There are (\d+) of a max of (\d+).*?:\s*(.*)", out, re.S)
+              if m: return int(m.group(1)), int(m.group(2)), [p.strip() for p in m.group(3).split(",") if p.strip()]
+              return None, None, []
+
+          def session_uptime():
+              try:
+                  start = int(open("/tmp/session_start_epoch").read().strip())
+                  sec = int(time.time()) - start
+                  return f"{sec//3600}h {(sec%3600)//60}m"
+              except Exception: return "unknown"
+
+          def status_text():
+              c = mc_container()
+              running = c and sh(f"docker inspect -f '{{{{.State.Running}}}}' {c}") == "true"
+              load = open("/proc/loadavg").read().split()[:3]
+              du = shutil.disk_usage("/")
+              stats = sh(f"docker stats --no-stream --format 'CPU {{{{.CPUPerc}}}} | RAM {{{{.MemUsage}}}}' {c}") if running else ""
+              n, mx, plist = players() if running else (None, None, [])
+              ptxt = f"{n}/{mx} — {', '.join(plist)}" if n is not None else "server offline"
+              return (f"📊 SERVER STATUS\n"
+                      f"🖥️ Minecraft: {'🟢 ONLINE' if running else '🔴 OFFLINE'} (container: {c or 'not created'})\n"
+                      f"👥 Players: {ptxt}\n"
+                      f"🌐 Join: {tailscale_ip()}:25565\n"
+                      f"🎛️ Panel: http://{tailscale_ip()}:8080\n"
+                      f"⏱️ Session uptime: {session_uptime()} / ~5h30m\n"
+                      f"📈 Load: {' '.join(load)}  {stats}\n"
+                      f"💽 Disk free: {du.free//(1024**3)} GB")
+
+          # ---------------- Power control ----------------
+          def mc_power(action):
+              c = mc_container()
+              if not c:
+                  return "⚠️ Abhi koi Minecraft server container nahi bana. Pehle Panel me server banao (README dekho) ya direct mode use karo."
+              if action == "stop":
+                  try: rcon("save-all flush"); time.sleep(2); rcon("stop"); return "⏹️ Server ko clean stop bhej diya (world save ho gaya)."
+                  except Exception: sh(f"docker stop -t 30 {c}"); return "⏹️ Server docker se stop kar diya."
+              if action == "start":
+                  sh(f"docker start {c}"); return "▶️ Server start kar diya! 1-2 min me join kar sakte ho."
+              if action == "restart":
+                  mc_power("stop"); time.sleep(5); return mc_power("start")
+              return "?"
+
+          def cancel_workflow():
+              url = f"https://api.github.com/repos/{REPO}/actions/runs/{RUN_ID}/cancel"
+              req = urllib.request.Request(url, method="POST")
+              req.add_header("Authorization", f"token {GH_TOKEN}")
+              req.add_header("Accept", "application/vnd.github+json")
+              try: urllib.request.urlopen(req, timeout=15)
+              except Exception: pass
+
+          def write_action(a):
+              if os.path.exists("/tmp/main_loop_started"):
+                  open(ACTION_FILE, "w").write(a); return True
+              return False
+
+          # ---------------- Menus ----------------
+          def manage_menu():
+              kb = {"inline_keyboard": [
+                  [{"text": "▶️ START", "callback_data": "start"}, {"text": "⏹️ STOP", "callback_data": "stop"}, {"text": "🔁 RESTART", "callback_data": "restart"}],
+                  [{"text": "👥 PLAYERS", "callback_data": "players"}, {"text": "📊 STATUS", "callback_data": "status"}],
+                  [{"text": "💾 BACKUP NOW", "callback_data": "backup"}, {"text": "🎛️ PANEL LINK", "callback_data": "panel"}],
+                  [{"text": "♻️ NEW WORKFLOW (24/7 HANDOVER)", "callback_data": "handover"}],
+                  [{"text": "🛑 STOP WORKFLOW", "callback_data": "stopwf"}]]}
+              send(f"{now()} : Sir, /manage menu hazir hai 👇", kb)
+
+          def stopwf_menu():
+              kb = {"inline_keyboard": [
+                  [{"text": "💾 BACKUP & STOP", "callback_data": "backup_stop"}],
+                  [{"text": "❌ STOP WITHOUT BACKUP", "callback_data": "stop_nobackup"}]]}
+              send("Sir, workflow kaise band karun?", kb)
+
+          HELP = ("🙏 Namaste Sir! Commands:\n"
+                  "/manage — saare buttons wala control panel\n"
+                  "/status — players, load, uptime, IP\n"
+                  "/players — online players ki list\n"
+                  "/uptime — session kitna chala\n"
+                  "/load — CPU/RAM/Disk load\n"
+                  "/panel — Pterodactyl panel ka link\n"
+                  "/startmc /stopserver /restartserver — Minecraft control\n"
+                  "/backup — abhi FULL backup lo\n"
+                  "/cmd <command> — seedha server console me command\n"
+                  "   Example: /cmd op RootBlastgaming\n"
+                  "/op <name>, /deop <name>, /kick <name>, /ban <name>, /pardon <name>\n"
+                  "/say <msg>, /whitelist add|remove <name>\n"
+                  "/stopwf — workflow band karo (backup ke sath / bina)")
+
+          # ---------------- Main polling loop ----------------
+          def main():
+              api_call("deleteWebhook", {"drop_pending_updates": "true"})
+              res = api_call("getUpdates", {"timeout": 1})
+              offset = 0
+              if res and res.get("ok"):
+                  for u in res.get("result", []): offset = max(offset, u["update_id"] + 1)
+              send(f"{now()} : 🤖 Sir, Telegram bot ONLINE hai! /manage bhej kar control panel kholo.")
+              while True:
+                  res = api_call("getUpdates", {"offset": offset, "timeout": 20})
+                  if not res or not res.get("ok"):
+                      time.sleep(3); continue
+                  for u in res.get("result", []):
+                      offset = u["update_id"] + 1
+                      msg = u.get("message")
+                      if msg and str(msg.get("chat", {}).get("id")) == CHAT_ID:
+                          text = (msg.get("text") or "").strip()
+                          parts = text.split(maxsplit=1)
+                          cmd = parts[0].lower() if parts else ""
+                          arg = parts[1] if len(parts) > 1 else ""
+                          try:
+                              if cmd in ("/start", "/help"): send(HELP)
+                              elif cmd == "/manage": manage_menu()
+                              elif cmd == "/status": send(status_text())
+                              elif cmd == "/players":
+                                  n, mx, plist = players()
+                                  send(f"👥 Online: {n}/{mx}\n" + ("\n".join("• " + p for p in plist) if plist else "Koi online nahi hai.") if n is not None else rcon_safe("list"))
+                              elif cmd == "/uptime": send(f"⏱️ Session uptime: {session_uptime()} (limit ~5h30m, phir auto naya workflow)")
+                              elif cmd == "/load":
+                                  load = open("/proc/loadavg").read().split()[:3]
+                                  du = shutil.disk_usage("/")
+                                  send(f"📈 Load avg: {' '.join(load)}\n💽 Disk: {du.used//(1024**3)}/{du.total//(1024**3)} GB used\n" + sh("free -h | head -2"))
+                              elif cmd == "/panel": send(f"🎛️ Panel: http://{tailscale_ip()}:8080\n🌐 Minecraft join: {tailscale_ip()}:25565\n(Note: dono sirf aapke Tailscale wale devices se khulenge)")
+                              elif cmd == "/startmc" or cmd == "/startserver": send(mc_power("start"))
+                              elif cmd == "/stopserver": send(mc_power("stop"))
+                              elif cmd == "/restartserver": send(mc_power("restart"))
+                              elif cmd == "/backup":
+                                  send("💾 Backup shuru kar raha hoon Sir, progress yahi aayega...")
+                                  write_action("backup_now")
+                              elif cmd == "/stopwf": stopwf_menu()
+                              elif cmd == "/cmd":
+                                  if not arg: send("Usage: /cmd <command>\nExample: /cmd op RootBlastgaming")
+                                  else: send(f"🖥️ Console > {arg}\n📤 {rcon_safe(arg)}")
+                              elif cmd in ("/op", "/deop", "/kick", "/ban", "/pardon") and arg:
+                                  name = arg.split()[0]
+                                  send(f"📤 {rcon_safe(f'{cmd[1:]} {name}')}")
+                              elif cmd == "/say" and arg: send(f"📤 {rcon_safe('say ' + arg)}")
+                              elif cmd == "/whitelist" and arg: send(f"📤 {rcon_safe('whitelist ' + arg)}")
+                              elif text: send("🤔 Ye command nahi samjha Sir. /help dekho.")
+                          except Exception as e:
+                              send(f"❌ Error: {e}")
+                      cb = u.get("callback_query")
+                      if cb and str(cb.get("message", {}).get("chat", {}).get("id")) == CHAT_ID:
+                          data = cb.get("data", "")
+                          api_call("answerCallbackQuery", {"callback_query_id": cb["id"]})
+                          if data == "start": send(mc_power("start"))
+                          elif data == "stop": send(mc_power("stop"))
+                          elif data == "restart": send(mc_power("restart"))
+                          elif data == "status": send(status_text())
+                          elif data == "players":
+                              n, mx, plist = players()
+                              send(f"👥 Online: {n}/{mx}\n" + ("\n".join("• " + p for p in plist) if plist else "Koi online nahi.") if n is not None else rcon_safe("list"))
+                          elif data == "panel": send(f"🎛️ Panel: http://{tailscale_ip()}:8080\n🌐 Join: {tailscale_ip()}:25565")
+                          elif data == "backup": send("💾 Backup queue me laga diya Sir..."); write_action("backup_now")
+                          elif data == "handover":
+                              if write_action("handover"): send("♻️ Handover shuru: pehle safe backup, phir naya workflow auto-start hoga (2-5 min gap ayega).")
+                              else: send("⚠️ System abhi ready nahi hai.")
+                          elif data == "stopwf": stopwf_menu()
+                          elif data == "backup_stop":
+                              if write_action("backup_stop"): send("💾 Backup karke workflow band kar raha hoon...")
+                              else:
+                                  open("/tmp/stop_requested", "w").write("1"); cancel_workflow()
+                          elif data == "stop_nobackup":
+                              send(f"{now()} : 🛑 Bina backup workflow band ho raha hai. (LIVE backup Drive par hai)")
+                              open("/tmp/stop_requested", "w").write("1")
+                              open("/tmp/skip_final_backup", "w").write("1")
+                              cancel_workflow()
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          tmux kill-session -t tgbot 2>/dev/null || true
+          tmux new-session -d -s tgbot 'python3 /tmp/telegram_bot.py'
+          echo "Telegram bot started in tmux session: tgbot"
+
+      # ============================================================
+      # STEP 4: RESTORE TAILSCALE IDENTITY (purana smart tarika:
+      #         isiliye har run me SAME Tailscale IP milta hai)
+      # ============================================================
+      - name: 📡 Restore Tailscale Identity
+        run: |
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 📡 Step 4: Drive se purani Tailscale identity check ho rahi hai..." > /dev/null || true
+          sudo hostnamectl set-hostname mcserver || true
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl stop tailscaled 2>/dev/null || true
+          mkdir -p ./restore
+          FOUND=$(rclone lsf gdrive: --files-only -R 2>/dev/null | grep -E '(^|/)tailscale-state\.tar\.gz$' | head -1 || true)
+          if [ -n "$FOUND" ]; then
+            rclone copyto "gdrive:${FOUND}" "./restore/tailscale-state.tar.gz"
+            sudo rm -rf /var/lib/tailscale/* 2>/dev/null || true
+            sudo mkdir -p /var/lib/tailscale
+            sudo tar -xzf ./restore/tailscale-state.tar.gz -C /var/lib/
+            echo "TAILSCALE_STATUS=restored" >> "$GITHUB_ENV"
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ✅ Sir, Tailscale identity restore ho gayi — IP purana wala hi milega." > /dev/null || true
+          else
+            echo "TAILSCALE_STATUS=fresh" >> "$GITHUB_ENV"
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ℹ️ Sir, purana Tailscale backup nahi mila, fresh identity banegi." > /dev/null || true
+          fi
+
+      # ============================================================
+      # STEP 5: START TAILSCALE
+      # ============================================================
+      - name: 🌐 Start Tailscale Network
+        run: |
+          sudo systemctl start tailscaled || sudo tailscaled --tun=userspace-networking &
+          sleep 5
+          sudo tailscale up --authkey "${{ secrets.TAILSCALE_AUTHKEY }}" --hostname=mcserver --ssh || true
+          sleep 8
+          TS_IP=$(tailscale ip -4 2>/dev/null || echo "not available")
+          echo "TS_IP=${TS_IP}" >> "$GITHUB_ENV"
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🌐 Sir, Tailscale ONLINE! IP: ${TS_IP} | Panel yahi khulega: http://${TS_IP}:8080 | Minecraft join: ${TS_IP}:25565" > /dev/null || true
+
+      # ============================================================
+      # STEP 6: INITIAL TAILSCALE BACKUP (sirf fresh identity par)
+      # ============================================================
+      - name: 💾 Initial Tailscale Backup
+        run: |
+          if [ "${TAILSCALE_STATUS}" = "fresh" ]; then
+            sudo tar -czf /tmp/tailscale-state.tar.gz -C /var/lib tailscale 2>/dev/null || true
+            rclone copyto /tmp/tailscale-state.tar.gz gdrive:tailscale-state.tar.gz --ignore-times || true
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ✅ Sir, nayi Tailscale identity ka backup Drive par safe ho gaya." > /dev/null || true
+          else
+            echo "Identity restored, initial backup skip."
+          fi
+
+      # ============================================================
+      # STEP 7: RESTORE FULL DATA (Panel DB + Wings + World)
+      # ============================================================
+      - name: 🪟 Restore Panel + Minecraft Data
+        run: |
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ⬇️ Step 7: Drive se Panel + Minecraft ka FULL backup check ho raha hai..." > /dev/null || true
+          mkdir -p ./restore
+          FOUND_ZST=$(rclone lsf gdrive: --files-only -R 2>/dev/null | grep -E '(^|/)minecraft-backup\.tar\.zst$' | head -1 || true)
+          FOUND_GZ=$(rclone lsf gdrive: --files-only -R 2>/dev/null | grep -E '(^|/)minecraft-backup\.tar\.gz$' | head -1 || true)
+          if [ -n "$FOUND_ZST" ]; then
+            /usr/local/bin/rclone_progress.sh "gdrive:${FOUND_ZST}" "./restore/minecraft-backup.tar.zst" "Downloading FULL Backup"
+            sudo tar -I zstd -xf "./restore/minecraft-backup.tar.zst" -C /
+            echo "DATA_STATUS=restored" >> "$GITHUB_ENV"
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ✅ Sir, Panel + World ka data restore ho gaya! Ab Panel start ho raha hai." > /dev/null || true
+          elif [ -n "$FOUND_GZ" ]; then
+            /usr/local/bin/rclone_progress.sh "gdrive:${FOUND_GZ}" "./restore/minecraft-backup.tar.gz" "Downloading Legacy Backup"
+            sudo tar -xzf "./restore/minecraft-backup.tar.gz" -C /
+            echo "DATA_STATUS=restored" >> "$GITHUB_ENV"
+          else
+            echo "DATA_STATUS=fresh" >> "$GITHUB_ENV"
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ℹ️ Sir, koi purana backup nahi mila — pehli baar Panel scratch se install hoga (5-10 min lagenge)." > /dev/null || true
+          fi
+
+      # ============================================================
+      # STEP 8: PTERODACTYL PANEL (Docker Compose, official image)
+      # Panel + MariaDB + Redis. Browser: http://<TailscaleIP>:8080
+      # ============================================================
+      - name: 🎛️ Install & Start Pterodactyl Panel
+        run: |
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🎛️ Step 8: Pterodactyl Panel install/start ho raha hai..." > /dev/null || true
+
+          sudo mkdir -p /opt/pterodactyl/{database,var,nginx,certs,logs}
+          # Passwords ek baar bante hain, phir backup me persist hote hain
+          if [ ! -f /opt/pterodactyl/secrets.env ]; then
+            sudo tee /opt/pterodactyl/secrets.env > /dev/null <<SECEOF
+          DB_PASSWORD=$(openssl rand -hex 16)
+          DB_ROOT_PASSWORD=$(openssl rand -hex 16)
+          SECEOF
+          fi
+          set -a; source /opt/pterodactyl/secrets.env; set +a
+          TS_IP=$(tailscale ip -4 2>/dev/null || echo "127.0.0.1")
+
+          cat > /tmp/panel.env <<ENVEOF
+          DB_PASSWORD=${DB_PASSWORD}
+          DB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+          PANEL_URL=http://${TS_IP}:8080
+          ENVEOF
+
+          cat << 'COMPOSEEOF' | sudo tee /opt/pterodactyl/docker-compose.yml >/dev/null
+          services:
+            database:
+              image: mariadb:11
+              container_name: pterodactyl-database
+              restart: unless-stopped
+              command: --default-authentication-plugin=mysql_native_password
+              volumes:
+                - "/opt/pterodactyl/database:/var/lib/mysql"
+              environment:
+                MYSQL_DATABASE: "panel"
+                MYSQL_USER: "pterodactyl"
+                MYSQL_PASSWORD: "${DB_PASSWORD}"
+                MYSQL_ROOT_PASSWORD: "${DB_ROOT_PASSWORD}"
+            cache:
+              image: redis:alpine
+              container_name: pterodactyl-cache
+              restart: unless-stopped
+            panel:
+              image: ghcr.io/pterodactyl/panel:v1.15.0
+              container_name: pterodactyl-panel
+              restart: unless-stopped
+              ports:
+                - "8080:80"
+              links: [database, cache]
+              volumes:
+                - "/opt/pterodactyl/var:/app/var"
+                - "/opt/pterodactyl/nginx:/etc/nginx/http.d"
+                - "/opt/pterodactyl/certs:/etc/letsencrypt"
+                - "/opt/pterodactyl/logs:/app/storage/logs"
+              environment:
+                APP_URL: "${PANEL_URL}"
+                APP_TIMEZONE: "Asia/Kolkata"
+                APP_SERVICE_AUTHOR: "noreply@example.com"
+                MAIL_FROM: "noreply@example.com"
+                MAIL_DRIVER: "log"
+                APP_ENV: "production"
+                APP_ENVIRONMENT_ONLY: "false"
+                CACHE_DRIVER: "redis"
+                SESSION_DRIVER: "redis"
+                QUEUE_DRIVER: "redis"
+                REDIS_HOST: "cache"
+                DB_HOST: "database"
+                DB_PORT: "3306"
+                DB_DATABASE: "panel"
+                DB_USERNAME: "pterodactyl"
+                DB_PASSWORD: "${DB_PASSWORD}"
+                HASHIDS_LENGTH: 8
+          COMPOSEEOF
+          # compose ko passwords .env se milenge
+          sudo cp /tmp/panel.env /opt/pterodactyl/.env
+
+          cd /opt/pterodactyl
+          sudo docker compose pull
+          sudo docker compose up -d
+
+          echo "Panel healthy hone ka wait kar rahe hain (first run me migration lagta hai)..."
+          for i in $(seq 1 60); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080 2>/dev/null || echo 000)
+            [ "$CODE" != "000" ] && [ "$CODE" != "502" ] && { echo "Panel UP (HTTP $CODE)"; break; }
+            sleep 5
+          done
+
+          # Pehli baar: admin user auto-create (secret se)
+          if [ "${DATA_STATUS}" = "fresh" ] && [ -n "${PANEL_ADMIN_EMAIL}" ] && [ -n "${PANEL_ADMIN_PASSWORD}" ]; then
+            sleep 10
+            sudo docker compose exec -T panel php artisan p:user:make \
+              --email="${PANEL_ADMIN_EMAIL}" \
+              --username="${PANEL_ADMIN_USERNAME:-admin}" \
+              --name-first="Minecraft" --name-last="Admin" \
+              --password="${PANEL_ADMIN_PASSWORD}" --admin=1 --no-interaction || true
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🔑 Sir, Panel admin account ban gaya! Browser me kholo: http://${TS_IP}:8080 | Username: ${PANEL_ADMIN_USERNAME:-admin} | Password: jo aapne PANEL_ADMIN_PASSWORD secret me rakha hai. (Password Telegram par nahi bhej raha — security!)" > /dev/null || true
+          fi
+
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🎛️ Sir, Pterodactyl Panel LIVE hai! 👉 http://${TS_IP}:8080 (sirf aapke Tailscale devices se khulega)" > /dev/null || true
+
+      # ============================================================
+      # STEP 9: WINGS DAEMON (Panel ka engine jo Minecraft chalata hai)
+      # ============================================================
+      - name: 🪽 Install Wings + Watcher
+        run: |
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🪽 Step 9: Wings daemon install ho raha hai..." > /dev/null || true
+          sudo mkdir -p /etc/pterodactyl /var/lib/pterodactyl /var/log/pterodactyl
+          if [ ! -x /usr/local/bin/wings ]; then
+            sudo curl -L -o /usr/local/bin/wings "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_$([[ "$(uname -m)" == "x86_64" ]] && echo "amd64" || echo "arm64")"
+            sudo chmod u+x /usr/local/bin/wings
+          fi
+          # Watcher: config milte hi Wings start, server milte hi RCON on
+          tmux kill-session -t wings 2>/dev/null || true
+          tmux new-session -d -s wings '/usr/local/bin/wings_watcher.sh'
+          TS_IP=$(tailscale ip -4 2>/dev/null || echo "IP")
+          if [ -f /etc/pterodactyl/config.yml ]; then
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ✅ Sir, Wings ka purana config restore ho gaya hai — Wings khud start ho jayega, aapko kuch nahi karna." > /dev/null || true
+          else
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ⚠️ Sir, PEHLI BAAR ka one-time setup bacha hai (sirf 5 min, sirf ek baar): 1) Panel http://${TS_IP}:8080 kholo, login karo. 2) Admin > Locations > Create: naam GitHub. 3) Admin > Nodes > Create New: Name=mc-node, Location=GitHub, FQDN=${TS_IP}, SSL=OFF, Behind Proxy=No, Memory=10240, Overallocate=0, Disk=40960, Daemon Port=8081, SFTP=2022. Allocation add karo: ${TS_IP} port 25565. 4) Node kholo > Configuration tab ka pura code copy karo. 5) Apne PC se Tailscale SSH: ssh runner@mcserver — phir: sudo nano /etc/pterodactyl/config.yml me paste karke save. Wings apne aap start ho jayega (message ayega). 6) Panel me Servers > Create New: Paper egg, allocation 25565, memory 5120 — phir Start! Full photo-guide README me hai Sir." > /dev/null || true
+          fi
+
+      # ============================================================
+      # STEP 10: MINECRAFT START
+      #  - direct mode  : itzg docker image se turant server
+      #  - pterodactyl  : Wings se chalta hai (Step 9 watcher sambhalta hai)
+      # ============================================================
+      - name: 🚀 Start Minecraft (mode ke hisab se)
+        run: |
+          TS_IP=$(tailscale ip -4 2>/dev/null || echo "not available")
+          if [ "${{ inputs.server_mode }}" = "direct" ]; then
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🚀 Step 10: Direct mode — Minecraft (Paper) container start ho raha hai..." > /dev/null || true
+            sudo mkdir -p /opt/minecraft/data
+            docker rm -f minecraft 2>/dev/null || true
+            docker run -d --name minecraft \
+              -e EULA=TRUE \
+              -e TYPE="${{ inputs.mc_type }}" \
+              -e VERSION="${{ inputs.mc_version }}" \
+              -e MEMORY="${{ inputs.mc_memory }}" \
+              -e ENABLE_RCON=true \
+              -e RCON_PASSWORD="${MC_RCON_PASSWORD}" \
+              -e RCON_PORT=25575 \
+              -e OPS="${{ inputs.ops }}" \
+              -e MOTD="RootBlastgaming 24x7 Server" \
+              -e TZ="Asia/Kolkata" \
+              -p 25565:25565 \
+              -v /opt/minecraft/data:/data \
+              itzg/minecraft-server:java21
+            echo "Minecraft boot ka wait (1-4 min)..."
+            READY=0
+            for i in $(seq 1 60); do
+              if python3 /tmp/rcon.py "list" >/dev/null 2>&1; then READY=1; break; fi
+              sleep 10
+            done
+            NOW=$(date '+%I:%M:%S %p')
+            if [ "$READY" = "1" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🟢 Sir, Minecraft LIVE hai! Join karo: ${TS_IP}:25565 | OP aap pehle se ho (${{ inputs.ops }}). Telegram par /manage kholo!" > /dev/null || true
+            else
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ⏳ Sir, Minecraft abhi boot ho raha hai, 2-3 min me ${TS_IP}:25565 par try karo. /status se check kar sakte ho." > /dev/null || true
+            fi
+          else
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🚀 Step 10: Pterodactyl mode hai Sir. Agar Node/Server pehle bana hua hai to Wings use khud start kar dega — server volume detect hote hi message ayega. Pehli baar hai to Step 9 wala 5-min setup kar do, bas ek baar!" > /dev/null || true
+          fi
+
+      # ============================================================
+      # STEP 11: LIVE BACKUP START (har change ~seconds me Drive par)
+      # ============================================================
+      - name: 🔴 Start LIVE Backup
+        run: |
+          tmux kill-session -t livebackup 2>/dev/null || true
+          tmux new-session -d -s livebackup '/usr/local/bin/live_sync.sh'
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🔴 Sir, LIVE backup ON hai (gdrive:minecraft-live-backup) — world me jo badlega, ~15-30 sec me Drive par hoga. FULL backup har 1 ghante me hoga (server band kiye bina). Session limit ~5h30m, phir backup karke naya workflow KHUD start hoga." > /dev/null || true
+
+      # ============================================================
+      # STEP 12: MAIN CONTROLLER LOOP
+      #  - har 1h FULL backup    - 5h30m par 24/7 handover
+      #  - player join/leave msg - Telegram actions (backup/stop)
+      # ============================================================
+      - name: 🔄 Main Loop (Hourly Backup + 24/7 Handover + Events)
+        run: |
+          touch /tmp/main_loop_started
+          date +%s > /tmp/session_start_epoch
+          source /usr/local/bin/mc_common.sh
+
+          trigger_next_workflow() {
+            if [ -f /tmp/next_run_triggered ]; then return 0; fi
+            curl -s -X POST \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+              -d "{\"ref\":\"${GITHUB_REF_NAME}\"}" > /dev/null || true
+            touch /tmp/next_run_triggered
+          }
+
+          START_TIME=$(date +%s)
+          TOTAL_SECONDS=19800        # 5h30m : phir handover (job hard-limit 6h hai)
+          BACKUP_INTERVAL=3600       # har 1 ghanta FULL backup
+          LAST_BACKUP_TIME=$START_TIME
+          AUTO_RESTART_NORM=$(echo "${AUTO_RESTART:-true}" | tr '[:upper:]' '[:lower:]')
+
+          notify_telegram "🟢 Sir, Controller ACTIVE hai. FULL backup har 1h, LIVE backup har kuch seconds, auto-handover 5h30m par (AUTO_RESTART=${AUTO_RESTART_NORM})."
+
+          PREV_PLAYERS_FILE=/tmp/players_prev.txt; touch "$PREV_PLAYERS_FILE"
+          POLL=0
+          while true; do
+            sleep 5
+            NOW_S=$(date +%s)
+            ELAPSED=$((NOW_S - START_TIME))
+
+            # ---- 5h30m ho gaya: backup -> naya workflow -> band ----
+            if [ "$ELAPSED" -ge "$TOTAL_SECONDS" ]; then
+              if [ "$AUTO_RESTART_NORM" = "true" ]; then
+                notify_telegram "♻️ Sir, 5h30m pure! Safe backup karke NAYA workflow khud start kar raha hoon. Minecraft 2-5 min me wapas online hoga (1-2 sec possible nahi hota, GitHub runner banne me time lagta hai)."
+                /usr/local/bin/mc_backup.sh "Auto Handover (5h30m)" || true
+                trigger_next_workflow
+              else
+                notify_telegram "⏳ Sir, session limit aa gaya aur AUTO_RESTART off hai. Final backup karke band kar raha hoon."
+                touch /tmp/stop_requested
+              fi
+              break
+            fi
+
+            # ---- Telegram se aaya hua action ----
+            if [ -f /tmp/telegram_action ]; then
+              ACTION=$(cat /tmp/telegram_action); rm -f /tmp/telegram_action
+              case "$ACTION" in
+                backup_now)
+                  /usr/local/bin/mc_backup.sh "Telegram /backup Command" || true
+                  LAST_BACKUP_TIME=$(date +%s); rm -f /tmp/skip_final_backup ;;
+                backup_stop)
+                  /usr/local/bin/mc_backup.sh "Telegram Backup & Stop" || true
+                  touch /tmp/stop_requested; break ;;
+                handover)
+                  /usr/local/bin/mc_backup.sh "Telegram Manual Handover" || true
+                  trigger_next_workflow; break ;;
+              esac
+            fi
+
+            # ---- Har 1 ghante FULL backup (bina server band kiye) ----
+            if [ $((NOW_S - LAST_BACKUP_TIME)) -ge "$BACKUP_INTERVAL" ]; then
+              /usr/local/bin/mc_backup.sh "1-Hour Auto Timer" || true
+              LAST_BACKUP_TIME=$(date +%s); rm -f /tmp/skip_final_backup
+            fi
+
+            # ---- Player join/leave + alerts (har ~30 sec) ----
+            POLL=$((POLL + 1))
+            if [ $((POLL % 6)) -eq 0 ]; then
+              LIST_OUT=$(python3 /tmp/rcon.py "list" 2>/dev/null || true)
+              CUR=$(echo "$LIST_OUT" | sed -n 's/.*players online: //p' | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | sort || true)
+              echo "$CUR" > /tmp/players_cur.txt
+              JOINED=$(comm -13 "$PREV_PLAYERS_FILE" /tmp/players_cur.txt 2>/dev/null || true)
+              LEFT=$(comm -23 "$PREV_PLAYERS_FILE" /tmp/players_cur.txt 2>/dev/null || true)
+              [ -n "$JOINED" ] && notify_telegram "🎮 Sir, player JOIN hua: $(echo $JOINED | tr '\n' ' ')! Server me swagat hai 🙏"
+              [ -n "$LEFT" ] && notify_telegram "👋 Sir, player chala gaya: $(echo $LEFT | tr '\n' ' '). LIVE backup me uska kaam safe hai."
+              cp /tmp/players_cur.txt "$PREV_PLAYERS_FILE" 2>/dev/null || true
+              DISK_PCT=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
+              [ "${DISK_PCT:-0}" -ge 88 ] && [ ! -f /tmp/disk_alerted ] && { notify_telegram "⚠️ Sir, disk ${DISK_PCT}% bhar gaya hai! Purane backup/world size check karo."; touch /tmp/disk_alerted; }
+            fi
+          done
+          echo "Main loop finished."
+
+      # ============================================================
+      # STEP 13: FINAL EMERGENCY BACKUP (hamesha chalega)
+      # ============================================================
+      - name: 🚨 Final Emergency Backup
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f /tmp/skip_final_backup ]; then
+            echo "Final backup skipped (already secured or stop without backup)."
+            exit 0
+          fi
+          if [ ! -f /tmp/main_loop_started ]; then echo "Main loop kabhi start hi nahi hua, backup skip."; exit 0; fi
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🚨 Sir, session band ho raha hai — final emergency backup le raha hoon..." > /dev/null || true
+          /usr/local/bin/mc_backup.sh "Final Emergency Backup" || true
+
+      # ============================================================
+      # STEP 14: AUTO-RESTART (error/timeout par bhi naya workflow)
+      # ============================================================
+      - name: ♻️ Auto-Restart Next Workflow
+        if: always()
+        continue-on-error: true
+        run: |
+          AUTO_NORM=$(echo "${AUTO_RESTART:-true}" | tr '[:upper:]' '[:lower:]')
+          if [ "$AUTO_NORM" != "true" ]; then echo "AUTO_RESTART off hai."; exit 0; fi
+          if [ -f /tmp/stop_requested ]; then echo "User ne stop manga tha, restart nahi hoga."; exit 0; fi
+          if [ -f /tmp/next_run_triggered ]; then echo "Naya workflow pehle hi start kar diya hai."; exit 0; fi
+          if [ ! -f /tmp/main_loop_started ]; then echo "Session thik se start hi nahi hui thi, restart skip (loop rokne ke liye)."; exit 0; fi
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ♻️ Sir, session khatam/error hua — 24/7 mode me naya workflow KHUD start kar raha hoon. 2-5 min me server wapas hoga." > /dev/null || true
+          curl -s -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+            -d "{\"ref\":\"${GITHUB_REF_NAME}\"}" > /dev/null || true
+          touch /tmp/next_run_triggered
+
+      # ============================================================
+      # STEP 15: CLEAN SHUTDOWN
+      # ============================================================
+      - name: 🧹 Clean Shutdown
+        if: always()
+        continue-on-error: true
+        run: |
+          tmux kill-session -t tgbot 2>/dev/null || true
+          tmux kill-session -t livebackup 2>/dev/null || true
+          tmux kill-session -t wings 2>/dev/null || true
+          C=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^minecraft$' || true)
+          [ -n "$C" ] && timeout 60 docker stop minecraft >/dev/null 2>&1 || true
+          NOW=$(date '+%I:%M:%S %p')
+          MSG="✅ Sir, session saaf band ho gaya. Phir milenge! 🙏"
+          [ -f /tmp/next_run_triggered ] && MSG="♻️ Sir, purani session band — nayi session start ho chuki hai, 2-5 min me Minecraft wapas online hoga! 🎮"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ${MSG}" > /dev/null || true
