@@ -231,6 +231,38 @@ jobs:
                   print(f"RCON_ERROR: {e}", file=sys.stderr); sys.exit(1)
           PYEOF
 
+          # ---------- Wings network patch (172.18 takraav ka pakka ilaaj) ----------
+          cat << 'PYEOF' | sudo tee /usr/local/bin/patch_wings_network.py >/dev/null
+          #!/usr/bin/env python3
+          # Panel ki config.yml me docker.network aksar hota hi nahi hai —
+          # Wings tab andar chhupa default 172.18.0.0/16 leta hai jo Panel ke
+          # Docker network se takra jata hai. Ye helper us block ko
+          # 172.30.0.0/16 par set kar deta hai (ho to badal, na ho to jod).
+          import sys
+          try:
+              import yaml
+          except Exception:
+              sys.exit(0)
+          PATH = "/etc/pterodactyl/config.yml"
+          try:
+              with open(PATH) as f:
+                  data = yaml.safe_load(f) or {}
+          except Exception:
+              sys.exit(0)
+          docker = data.setdefault("docker", {})
+          network = docker.setdefault("network", {})
+          network["interface"] = "172.30.0.1"
+          interfaces = network.setdefault("interfaces", {})
+          v4 = interfaces.setdefault("v4", {})
+          v4["subnet"] = "172.30.0.0/16"
+          v4["gateway"] = "172.30.0.1"
+          try:
+              with open(PATH, "w") as f:
+                  yaml.safe_dump(data, f, sort_keys=False)
+          except Exception:
+              sys.exit(0)
+          PYEOF
+
           # ---------- BACKUP ENGINE (hourly + final + handover, teeno yahi use karte hain) ----------
           cat << 'EOF' | sudo tee /usr/local/bin/mc_backup.sh >/dev/null
           #!/bin/bash
@@ -323,6 +355,12 @@ jobs:
             # Wings start (sirf jab panel se config.yml aa jaye)
             if [ -f /etc/pterodactyl/config.yml ] && ! pgrep -x wings >/dev/null 2>&1; then
               sudo mkdir -p /var/lib/pterodactyl /var/log/pterodactyl /tmp/pterodactyl
+              # FIX: Panel ka Docker network Wings ke default 172.18.0.0/16
+              # pool se takra jata hai ("Pool overlaps" FATAL). Dhyaan do:
+              # Panel ki config me ye number hamesha likha NAHI hota — Wings
+              # use andar default rakhta hai. Isliye helper config me
+              # docker.network ko 172.30 par set/likh deta hai.
+              sudo python3 /usr/local/bin/patch_wings_network.py || true
               (sudo nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml > /tmp/wings.log 2>&1 &)
               notify_telegram "🪽 Sir, Wings daemon start ho gaya hai! Ab Panel se server Create/Start kar sakte hain."
               sleep 10
@@ -330,10 +368,12 @@ jobs:
             # Naya Minecraft server volume mila? RCON on kar do (Telegram /cmd ke liye)
             DIR=$(mc_data_dir 2>/dev/null || true)
             if [ -n "$DIR" ] && [ -f "$DIR/server.properties" ]; then
-              if ! grep -q "^rcon.password=${MC_RCON_PASSWORD}$" "$DIR/server.properties" 2>/dev/null; then
-                sed -i "s/^enable-rcon=.*/enable-rcon=true/" "$DIR/server.properties" 2>/dev/null || echo "enable-rcon=true" >> "$DIR/server.properties"
-                grep -q "^rcon.port=" "$DIR/server.properties" && sed -i "s/^rcon.port=.*/rcon.port=25575/" "$DIR/server.properties" || echo "rcon.port=25575" >> "$DIR/server.properties"
-                grep -q "^rcon.password=" "$DIR/server.properties" && sed -i "s|^rcon.password=.*|rcon.password=${MC_RCON_PASSWORD}|" "$DIR/server.properties" || echo "rcon.password=${MC_RCON_PASSWORD}" >> "$DIR/server.properties"
+              if ! sudo grep -q "^rcon.password=${MC_RCON_PASSWORD}$" "$DIR/server.properties" 2>/dev/null; then
+                # FIX: Wings ke server files 'pterodactyl' user ke hote hain,
+                # bina sudo ke sed fail ho jata tha aur RCON on hi nahi hota tha.
+                sudo sed -i "s/^enable-rcon=.*/enable-rcon=true/" "$DIR/server.properties" 2>/dev/null || echo "enable-rcon=true" | sudo tee -a "$DIR/server.properties" >/dev/null
+                sudo grep -q "^rcon.port=" "$DIR/server.properties" && sudo sed -i "s/^rcon.port=.*/rcon.port=25575/" "$DIR/server.properties" || echo "rcon.port=25575" | sudo tee -a "$DIR/server.properties" >/dev/null
+                sudo grep -q "^rcon.password=" "$DIR/server.properties" && sudo sed -i "s|^rcon.password=.*|rcon.password=${MC_RCON_PASSWORD}|" "$DIR/server.properties" || echo "rcon.password=${MC_RCON_PASSWORD}" | sudo tee -a "$DIR/server.properties" >/dev/null
                 if [ ! -f /tmp/rcon_notified ]; then
                   notify_telegram "🔌 Sir, server me RCON auto-enable ho gaya hai. Agar server chal raha tha to ek baar Panel/Telegram se RESTART kar do — phir /cmd kaam karega."
                   touch /tmp/rcon_notified
@@ -567,6 +607,8 @@ jobs:
                               elif cmd == "/uptime": send(f"⏱️ Session uptime: {session_uptime()} (limit ~5h30m, phir auto naya workflow)")
                               elif cmd == "/load":
                                   load = open("/proc/loadavg").read().split()[:3]
+                                  du = shutil.disk_usage("/")
+                                  send(f"📈 Load avgroc/loadavg").read().split()[:3]
                                   du = shutil.disk_usage("/")
                                   send(f"📈 Load avg: {' '.join(load)}\n💽 Disk: {du.used//(1024**3)}/{du.total//(1024**3)} GB used\n" + sh("free -h | head -2"))
                               elif cmd == "/panel": send(f"🎛️ Panel: http://{tailscale_ip()}:8080\n🌐 Minecraft join: {tailscale_ip()}:25565\n(Note: dono sirf aapke Tailscale wale devices se khulenge)")
@@ -876,6 +918,41 @@ jobs:
           fi
 
       # ============================================================
+      # STEP 10.5: PLAYIT AGENT (public join)
+      # Panel hamesha Tailscale IP par private rahega. Playit sirf
+      # Minecraft 25565 ko public karega, taaki players ko Tailscale
+      # na lagana pade. Agent official Docker image se chalega.
+      # ============================================================
+      - name: 🌍 Start Playit Agent (Public Join)
+        run: |
+          TS_IP=$(tailscale ip -4 2>/dev/null || echo "not available")
+          if [ -z "${PLAYIT_SECRET_KEY}" ]; then
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ⚠️ Sir, PLAYIT_SECRET_KEY secret nahi mila — isliye public join abhi band hai. Panel aur Tailscale join bilkul chalega. Playit chahiye to PLAYIT-GUIDE.md ke steps se secret bana kar GitHub me add karo, agle workflow se khud start ho jayega." > /dev/null || true
+            echo "PLAYIT_SECRET_KEY missing, Playit skip."
+            exit 0
+          fi
+          NOW=$(date '+%I:%M:%S %p')
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🌍 Step: Playit agent start ho raha hai (players ke public join ke liye). Panel aapka Tailscale par hi rahega, bilkul safe." > /dev/null || true
+          docker rm -f playit-agent 2>/dev/null || true
+          docker pull ghcr.io/playit-cloud/playit-agent:1.0
+          if docker run -d --name playit-agent --restart unless-stopped --net=host -e SECRET_KEY="${PLAYIT_SECRET_KEY}" ghcr.io/playit-cloud/playit-agent:1.0; then
+            sleep 12
+            if [ "$(docker inspect -f '{{.State.Running}}' playit-agent 2>/dev/null || echo false)" = "true" ]; then
+              docker logs --tail 30 playit-agent > /tmp/playit.log 2>&1 || true
+              NOW=$(date '+%I:%M:%S %p')
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ✅ Sir, Playit agent ONLINE hai! Ab playit.gg dashboard me ja kar Tunnels check karo. Agar tunnel nahi bana hai: Add Tunnel > Minecraft Java > Local address me ye likho: ${TS_IP} port 25565. Dashboard jo PUBLIC address dega (jaise xxxx.gl.at.ply.gg:12345) wahi players ko dena hai — unhe Tailscale NAHI lagega. Panel hamesha ki tarah: http://${TS_IP}:8080" > /dev/null || true
+              echo "Playit agent running."
+            else
+              NOW=$(date '+%I:%M:%S %p')
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ❌ Sir, Playit agent start hokar band ho gaya. Actions ke 'Start Playit Agent' step ke aakhri log bhej dena. Panel/Tailscale wala hissa bilkul chalega." > /dev/null || true
+              docker logs --tail 50 playit-agent 2>&1 || true
+            fi
+          else
+            echo "Playit container start failed."
+          fi
+
+      # ============================================================
       # STEP 11: LIVE BACKUP START (har change ~seconds me Drive par)
       # ============================================================
       - name: 🔴 Start LIVE Backup
@@ -1022,6 +1099,7 @@ jobs:
           tmux kill-session -t wings 2>/dev/null || true
           C=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^minecraft$' || true)
           [ -n "$C" ] && timeout 60 docker stop minecraft >/dev/null 2>&1 || true
+          timeout 20 docker stop playit-agent >/dev/null 2>&1 || true
           NOW=$(date '+%I:%M:%S %p')
           MSG="✅ Sir, session saaf band ho gaya. Phir milenge! 🙏"
           [ -f /tmp/next_run_triggered ] && MSG="♻️ Sir, purani session band — nayi session start ho chuki hai, 2-5 min me Minecraft wapas online hoga! 🎮"
