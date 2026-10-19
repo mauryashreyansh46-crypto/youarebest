@@ -76,7 +76,7 @@ env:
   GH_TOKEN: ${{ github.token }}
   GH_REPO: ${{ github.repository }}
   TZ: Asia/Kolkata
-  WORKFLOW_FILE: minecraft-server.yml
+  WORKFLOW_FILE: blank.yml
 
 jobs:
   # ==========================================================================
@@ -213,7 +213,7 @@ jobs:
           WF_MC_VERSION="${WF_MC_VERSION:-LATEST}"
           WF_MC_MEMORY="${WF_MC_MEMORY:-5G}"
           WF_OPS="${WF_OPS:-RootBlastgaming}"
-          if gh workflow run "${WORKFLOW_FILE:-minecraft-server.yml}" --ref "${GITHUB_REF_NAME:-main}" \
+          if gh workflow run "${WORKFLOW_FILE:-blank.yml}" --ref "${GITHUB_REF_NAME:-main}" \
             -f server_mode="$WF_SERVER_MODE" \
             -f mc_type="$WF_MC_TYPE" \
             -f mc_version="$WF_MC_VERSION" \
@@ -223,7 +223,7 @@ jobs:
             # Standby run ka ID note kar lo (galti se stop karna ho to
             # sirf isi ko cancel karenge, kisi aur run ko nahi)
             for i in $(seq 1 12); do
-              gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE:-minecraft-server.yml}/runs?per_page=20" > /tmp/standby_runs.json 2>/dev/null || true
+              gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE:-blank.yml}/runs?per_page=20" > /tmp/standby_runs.json 2>/dev/null || true
               SID=$(jq -r --arg cur "${GITHUB_RUN_ID:-}" '[.workflow_runs[] | select(.event=="workflow_dispatch") | select(.status!="completed") | select((.id|tostring)!=$cur)][0].id // empty' /tmp/standby_runs.json 2>/dev/null || true)
               if [ -n "$SID" ]; then echo "$SID" > /tmp/standby_run_id; break; fi
               sleep 5
@@ -244,7 +244,7 @@ jobs:
           if [ -z "$ID" ]; then
             # ID note nahi ho paya tha — queue me khada sabse naya dispatch
             # run dhoondho (apne current run ko chhod kar)
-            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE:-minecraft-server.yml}/runs?per_page=20" > /tmp/cancel_runs.json 2>/dev/null || true
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE:-blank.yml}/runs?per_page=20" > /tmp/cancel_runs.json 2>/dev/null || true
             ID=$(jq -r --arg cur "${GITHUB_RUN_ID:-}" '[.workflow_runs[] | select(.event=="workflow_dispatch") | select(.status=="queued") | select((.id|tostring)!=$cur)][0].id // empty' /tmp/cancel_runs.json 2>/dev/null || true)
           fi
           if [ -n "$ID" ]; then
@@ -369,7 +369,7 @@ jobs:
 
             # --- Har 60 sec: standby sach me queue me hai na? ---
             if [ $((NOW % 60)) -eq 0 ] && [ "$AUTO_NORM" = "true" ] && [ -f /tmp/next_run_triggered ]; then
-              gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE:-minecraft-server.yml}/runs?per_page=20" > /tmp/guard_runs.json 2>/dev/null || true
+              gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE:-blank.yml}/runs?per_page=20" > /tmp/guard_runs.json 2>/dev/null || true
               QUEUED=$(jq '[.workflow_runs[] | select(.event=="workflow_dispatch") | select(.status!="completed") | select((.id|tostring)!=(env.GITHUB_RUN_ID // ""))] | length' /tmp/guard_runs.json 2>/dev/null || echo 1)
               if [ "${QUEUED:-1}" = "0" ]; then
                 echo "[guard] standby queue gayab mili, flag saaf karke phir lagayenge"
@@ -692,7 +692,7 @@ jobs:
           GH_TOKEN  = os.environ.get("GH_TOKEN", "")
           REPO      = os.environ.get("GITHUB_REPOSITORY", "")
           RUN_ID    = os.environ.get("GITHUB_RUN_ID", "")
-          WF_FILE   = os.environ.get("WORKFLOW_FILE", "minecraft-server.yml")
+          WF_FILE   = os.environ.get("WORKFLOW_FILE", "blank.yml")
           RCON_PASS = os.environ.get("MC_RCON_PASSWORD", "")
           API = f"https://api.telegram.org/bot{BOT_TOKEN}"
           ACTION_FILE = "/tmp/telegram_action"
@@ -1611,9 +1611,4 @@ jobs:
           [ -f /tmp/next_run_triggered ] && MSG="♻️ Sir, purani session band — nayi session start ho chuki hai, 2-5 min me Minecraft wapas online hoga! 🎮"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ${MSG}" > /dev/null || true
 
-ndMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ${MSG}" > /dev/null || true
-
-t=${NOW} : ${MSG}" > /dev/null || true
-
-ndMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ${MSG}" > /dev/null || true
 
