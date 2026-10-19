@@ -11,10 +11,10 @@ name: 🎮 Minecraft 24-7 Persistent Server (Pterodactyl + Telegram)
 #                       2) LIVE backup (har change ~15-30 sec me Drive par)
 #                       3) Final emergency backup (timeout/error se pehle)
 #   Auto-restart     -> Smart deadline: timeout se pehle backup + naya run queue
-#   Watchdog         -> ISI file ke andar dusra job. Har 5 min (schedule par)
-#                       check karta hai: Minecraft run band pada ho aur user
-#                       ne khud stop na kiya ho to naya run khud start.
-#                       Alag se koi dusri file NAHI chahiye.
+#   Guard (Main Loop ke saath) -> Main Loop start hote hi dusra workflow
+#                       STANDBY queue me laga deta hai, har second health
+#                       check karta hai, aur smart deadline par backup
+#                       karke band — queued wala turant start ho jata hai.
 #
 # SABSE PEHLE README.md PADHO — Secrets aur first-run Panel steps wahi hain.
 # ============================================================================
@@ -46,14 +46,8 @@ on:
         description: "Server OP username(s), comma separated"
         required: true
         default: "RootBlastgaming"
-  # Watchdog isi file ke schedule se chalega. Schedule wale run me
-  # Minecraft wala job skip hoga, sirf Watchdog job chalega.
-  schedule:
-    - cron: "*/5 * * * *"
-
-# NOTE: Yahan upar concurrency NAHI lagayi hai, warna schedule wala
-# Watchdog bhi Minecraft wale bade run ke peeche atak jayega. Concurrency
-# ab har job ke andar alag-alag hai (minecraft-session / minecraft-watchdog).
+# NOTE: Concurrency job ke andar hai (minecraft-session), taaki standby
+# wala queued run GitHub me sahi se pending rahe.
 
 permissions:
   actions: write
@@ -86,8 +80,9 @@ env:
 
 jobs:
   # ==========================================================================
-  # JOB 1: MINECRAFT SESSION — sirf tab chalega jab workflow manually ya
-  # API/Watchdog se dispatch ho. Schedule wale run me ye skip rahega.
+  # EK HI JOB: MINECRAFT SESSION — jab workflow manually ya API se
+  # dispatch ho tab chalega. Isi ke Main Loop ke saath Guard feature
+  # start hota hai (standby queue + har-second health check).
   # ==========================================================================
   minecraft:
     name: 🖥️ Minecraft Session
@@ -141,11 +136,6 @@ jobs:
           sudo apt-get install -y -qq tmux python3 python3-yaml curl unzip net-tools neofetch iproute2 xxd jq util-linux zstd inotify-tools > /dev/null
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
-          # Naya session sach me start ho raha hai, isliye Watchdog ke liye
-          # purana STOP flag hata do. User Telegram /stopwf karega to bot
-          # ye flag phir bana dega aur Watchdog dobara start nahi karega.
-          rclone deletefile "gdrive:minecraft-control/STOP_WORKFLOW.txt" > /dev/null 2>&1 || true
-
           # ---------- rclone progress uploader (purane code se, improved) ----------
           cat << 'EOF' | sudo tee /usr/local/bin/rclone_progress.sh >/dev/null
           #!/bin/bash
@@ -198,6 +188,199 @@ jobs:
               -d chat_id="${TELEGRAM_CHAT_ID}" \
               --data-urlencode "text=$(date '+%I:%M:%S %p') : $1" > /dev/null || true
           }
+          EOF
+
+          # ---------- STANDBY QUEUE (Guard ke liye: dusra workflow pehle
+          # se GitHub me pending rakhna, taaki ye band hote hi wo turant
+          # start ho jaye) ----------
+          cat << 'EOF' | sudo tee /usr/local/bin/queue_standby.sh >/dev/null
+          #!/bin/bash
+          source /usr/local/bin/mc_common.sh
+          [ -f /tmp/workflow_inputs.env ] && source /tmp/workflow_inputs.env
+          # Ek hi baar queue ho — race se do run na ban jaye
+          exec 9>/tmp/queue_standby.lock
+          flock 9
+          if [ -f /tmp/next_run_triggered ]; then
+            echo "Standby pehle se queue hai."
+            exit 0
+          fi
+          if [ -f /tmp/stop_requested ]; then
+            echo "Stop manga gaya hai, standby queue nahi hoga."
+            exit 1
+          fi
+          WF_SERVER_MODE="${WF_SERVER_MODE:-pterodactyl}"
+          WF_MC_TYPE="${WF_MC_TYPE:-PAPER}"
+          WF_MC_VERSION="${WF_MC_VERSION:-LATEST}"
+          WF_MC_MEMORY="${WF_MC_MEMORY:-5G}"
+          WF_OPS="${WF_OPS:-RootBlastgaming}"
+          if gh workflow run "${WORKFLOW_FILE:-minecraft-server.yml}" --ref "${GITHUB_REF_NAME:-main}" \
+            -f server_mode="$WF_SERVER_MODE" \
+            -f mc_type="$WF_MC_TYPE" \
+            -f mc_version="$WF_MC_VERSION" \
+            -f mc_memory="$WF_MC_MEMORY" \
+            -f ops="$WF_OPS"; then
+            touch /tmp/next_run_triggered
+            # Standby run ka ID note kar lo (galti se stop karna ho to
+            # sirf isi ko cancel karenge, kisi aur run ko nahi)
+            for i in $(seq 1 12); do
+              gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE:-minecraft-server.yml}/runs?per_page=20" > /tmp/standby_runs.json 2>/dev/null || true
+              SID=$(jq -r --arg cur "${GITHUB_RUN_ID:-}" '[.workflow_runs[] | select(.event=="workflow_dispatch") | select(.status!="completed") | select((.id|tostring)!=$cur)][0].id // empty' /tmp/standby_runs.json 2>/dev/null || true)
+              if [ -n "$SID" ]; then echo "$SID" > /tmp/standby_run_id; break; fi
+              sleep 5
+            done
+            notify_telegram "🛡️ Sir, GUARD ne dusra workflow STANDBY queue me laga diya hai. Is session ko kuch bhi ho jaye, band hote hi wo turant start hoga."
+            exit 0
+          fi
+          notify_telegram "❌ Sir, Guard standby workflow queue NAHI kar paya. Main Loop/Auto-Restart wala rasta phir bhi koshish karega."
+          exit 1
+          EOF
+
+          # ---------- STANDBY CANCEL (user khud band kare to queue wala
+          # run galti se start na ho jaye) ----------
+          cat << 'EOF' | sudo tee /usr/local/bin/cancel_standby.sh >/dev/null
+          #!/bin/bash
+          ID=""
+          [ -f /tmp/standby_run_id ] && ID=$(tr -dc '0-9' < /tmp/standby_run_id || true)
+          if [ -z "$ID" ]; then
+            # ID note nahi ho paya tha — queue me khada sabse naya dispatch
+            # run dhoondho (apne current run ko chhod kar)
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE:-minecraft-server.yml}/runs?per_page=20" > /tmp/cancel_runs.json 2>/dev/null || true
+            ID=$(jq -r --arg cur "${GITHUB_RUN_ID:-}" '[.workflow_runs[] | select(.event=="workflow_dispatch") | select(.status=="queued") | select((.id|tostring)!=$cur)][0].id // empty' /tmp/cancel_runs.json 2>/dev/null || true)
+          fi
+          if [ -n "$ID" ]; then
+            curl -sS --connect-timeout 10 --max-time 30 -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${ID}/cancel" > /dev/null || true
+            echo "Standby run $ID cancel kar diya."
+          else
+            echo "Cancel karne ke liye koi standby run nahi mila."
+          fi
+          rm -f /tmp/standby_run_id
+          EOF
+
+          # ---------- GUARD (Main Loop ke saath start: har second nazar,
+          # standby queue pakki, chhoti kharabiyon ki khud marammat) ------
+          cat << 'EOF' | sudo tee /usr/local/bin/mc_guard.sh >/dev/null
+          #!/bin/bash
+          source /usr/local/bin/mc_common.sh
+          [ -f /tmp/workflow_inputs.env ] && source /tmp/workflow_inputs.env
+          echo "[guard] Guard start: $(date)"
+          LAST_TRIGGER_TRY=0
+          LAST_PANEL_HEAL=0
+          LAST_PLAYIT_HEAL=0
+          LAST_TAILSCALE_ALERT=0
+          LAST_DISK_ALERT=0
+          MC_WAS_RUNNING=0
+          while true; do
+            # Malik ne band kaha ho ya Main Loop khatam — Guard bhi rukega
+            if [ -f /tmp/stop_requested ] || [ -f /tmp/main_loop_finished ]; then
+              echo "[guard] stop/finished flag mila, Guard band."
+              break
+            fi
+            NOW=$(date +%s)
+            date +%s > /tmp/guard_heartbeat.tmp && mv /tmp/guard_heartbeat.tmp /tmp/guard_heartbeat
+
+            AUTO_NORM=$(echo "${AUTO_RESTART:-true}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+            [ -z "$AUTO_NORM" ] && AUTO_NORM="true"
+
+            # --- Standby queue pakki karo (60 sec me ek koshish) ---
+            if [ "$AUTO_NORM" = "true" ] && [ ! -f /tmp/next_run_triggered ] && [ $((NOW - LAST_TRIGGER_TRY)) -ge 60 ]; then
+              LAST_TRIGGER_TRY=$NOW
+              /usr/local/bin/queue_standby.sh || true
+            fi
+
+            # --- Har 5 sec: tmux wali services zinda hain? ---
+            if [ $((NOW % 5)) -eq 0 ]; then
+              if [ -f /tmp/telegram_bot.py ] && ! tmux has-session -t tgbot 2>/dev/null; then
+                tmux new-session -d -s tgbot 'python3 /tmp/telegram_bot.py'
+                notify_telegram "🛡️ Sir, Guard ne dekha Telegram bot band pada tha — khud dobara start kar diya hai."
+              fi
+              if ! tmux has-session -t livebackup 2>/dev/null; then
+                tmux new-session -d -s livebackup '/usr/local/bin/live_sync.sh'
+                notify_telegram "🛡️ Sir, Guard ne LIVE backup band pada dekha — khud dobara start kar diya hai."
+              fi
+              if ! tmux has-session -t wings 2>/dev/null; then
+                tmux new-session -d -s wings '/usr/local/bin/wings_watcher.sh'
+                notify_telegram "🛡️ Sir, Guard ne Wings watcher band pada dekha — khud dobara start kar diya hai."
+              fi
+
+              # Panel ke container (backup ke beech me Panel jaan-boojh
+              # kar rukta hai — us samay haath mat lagao)
+              if ! pgrep -f "[m]c_backup.sh" >/dev/null 2>&1 && [ -f /opt/pterodactyl/docker-compose.yml ] && [ $((NOW - LAST_PANEL_HEAL)) -ge 300 ]; then
+                PANEL_BAD=0
+                for CNAME in pterodactyl-panel pterodactyl-database pterodactyl-cache; do
+                  CST=$(docker inspect -f '{{.State.Running}}' "$CNAME" 2>/dev/null || echo missing)
+                  [ "$CST" != "true" ] && PANEL_BAD=1
+                done
+                if [ "$PANEL_BAD" = "1" ]; then
+                  LAST_PANEL_HEAL=$NOW
+                  (cd /opt/pterodactyl && sudo docker compose up -d) >> /tmp/mc_guard.log 2>&1 || true
+                  notify_telegram "🛡️ Sir, Guard ne Panel ka koi container band pada dekha — Panel dobara up karne ki koshish ki hai."
+                fi
+              fi
+
+              # Minecraft crash ho to khud uthao (par user ne jaan-boojh
+              # kar band kiya ho, exit 0/143, to haath mat lagao)
+              C=$(mc_container 2>/dev/null || true)
+              if [ -n "$C" ]; then
+                RUNNING=$(docker inspect -f '{{.State.Running}}' "$C" 2>/dev/null || echo false)
+                if [ "$RUNNING" = "true" ]; then
+                  MC_WAS_RUNNING=1
+                elif [ "$MC_WAS_RUNNING" = "1" ] && [ ! -f /tmp/mc_intentional_stop ] && [ ! -f /tmp/mc_crash_healed ]; then
+                  EXITCODE=$(docker inspect -f '{{.State.ExitCode}}' "$C" 2>/dev/null || echo 0)
+                  OOM=$(docker inspect -f '{{.State.OOMKilled}}' "$C" 2>/dev/null || echo false)
+                  if [ "$OOM" = "true" ] || { [ "$EXITCODE" != "0" ] && [ "$EXITCODE" != "143" ]; }; then
+                    docker start "$C" >> /tmp/mc_guard.log 2>&1 || true
+                    touch /tmp/mc_crash_healed
+                    notify_telegram "🛡️ Sir, Guard ne dekha Minecraft server crash hua tha (exit=$EXITCODE) — khud dobara START kar diya hai. Panel me ek baar check kar lo."
+                  fi
+                  MC_WAS_RUNNING=0
+                fi
+              fi
+            fi
+
+            # --- Har 10 sec: Playit agent zinda hai? ---
+            if [ $((NOW % 10)) -eq 0 ] && [ -n "${PLAYIT_SECRET_KEY:-}" ] && [ $((NOW - LAST_PLAYIT_HEAL)) -ge 60 ]; then
+              PST=$(docker inspect -f '{{.State.Running}}' playit-agent 2>/dev/null || echo missing)
+              if [ "$PST" != "true" ]; then
+                LAST_PLAYIT_HEAL=$NOW
+                if [ "$PST" = "missing" ]; then
+                  docker run -d --name playit-agent --restart unless-stopped --net=host -e SECRET_KEY="${PLAYIT_SECRET_KEY}" ghcr.io/playit-cloud/playit-agent:1.0 >> /tmp/mc_guard.log 2>&1 || true
+                else
+                  docker start playit-agent >> /tmp/mc_guard.log 2>&1 || true
+                fi
+                notify_telegram "🛡️ Sir, Guard ne Playit agent band pada dekha — dobara start kar diya hai. Public join wapas chalu hona chahiye."
+              fi
+            fi
+
+            # --- Har 30 sec: Tailscale + Disk ---
+            if [ $((NOW % 30)) -eq 0 ]; then
+              if ! tailscale ip -4 >/dev/null 2>&1 && [ $((NOW - LAST_TAILSCALE_ALERT)) -ge 900 ]; then
+                LAST_TAILSCALE_ALERT=$NOW
+                notify_telegram "⚠️ Sir, Guard ko Tailscale IP nahi mil raha. Panel/SSH atak sakta hai — ek baar check kar lo."
+              fi
+              DISK_PCT=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
+              if [ "${DISK_PCT:-0}" -ge 95 ] && [ $((NOW - LAST_DISK_ALERT)) -ge 900 ]; then
+                LAST_DISK_ALERT=$NOW
+                notify_telegram "⚠️ Sir, Guard bol raha hai disk ${DISK_PCT}% bhar gaya hai! Kuch saaf karo warna backup fail hoga."
+              fi
+            fi
+
+            # --- Har 60 sec: standby sach me queue me hai na? ---
+            if [ $((NOW % 60)) -eq 0 ] && [ "$AUTO_NORM" = "true" ] && [ -f /tmp/next_run_triggered ]; then
+              gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE:-minecraft-server.yml}/runs?per_page=20" > /tmp/guard_runs.json 2>/dev/null || true
+              QUEUED=$(jq '[.workflow_runs[] | select(.event=="workflow_dispatch") | select(.status!="completed") | select((.id|tostring)!=(env.GITHUB_RUN_ID // ""))] | length' /tmp/guard_runs.json 2>/dev/null || echo 1)
+              if [ "${QUEUED:-1}" = "0" ]; then
+                echo "[guard] standby queue gayab mili, flag saaf karke phir lagayenge"
+                rm -f /tmp/next_run_triggered /tmp/standby_run_id
+                LAST_TRIGGER_TRY=0
+              fi
+            fi
+
+            sleep 1
+          done
+          echo "[guard] Guard band: $(date)"
           EOF
 
           # ---------- RCON client (python stdlib only, koi pip nahi) ----------
@@ -486,7 +669,9 @@ jobs:
           EOF
 
           sudo chmod +x /usr/local/bin/rclone_progress.sh /usr/local/bin/mc_backup.sh \
-                        /usr/local/bin/live_sync.sh /usr/local/bin/wings_watcher.sh
+                        /usr/local/bin/live_sync.sh /usr/local/bin/wings_watcher.sh \
+                        /usr/local/bin/queue_standby.sh /usr/local/bin/cancel_standby.sh \
+                        /usr/local/bin/mc_guard.sh
           echo "Tools & scripts ready."
 
       # ============================================================
@@ -602,6 +787,13 @@ jobs:
                   return f"{sec//3600}h {(sec%3600)//60}m"
               except Exception: return "unknown"
 
+          def guard_status():
+              try:
+                  age = int(time.time()) - int(open("/tmp/guard_heartbeat").read().strip())
+                  return "🟢 active" if age < 10 else "🔴 stale"
+              except Exception:
+                  return "⚪ not started"
+
           def status_text():
               c = mc_container()
               running = c and sh(f"docker inspect -f '{{{{.State.Running}}}}' {c}") == "true"
@@ -617,6 +809,7 @@ jobs:
                       f"🔒 Private Join (Tailscale): {tailscale_ip()}:25565\n"
                       f"🎛️ Panel (sirf Tailscale se): http://{tailscale_ip()}:8080\n"
                       f"⏱️ Session uptime: {session_uptime()} / ~5h30m\n"
+                      f"🛡️ Guard: {guard_status()} | Standby workflow: {'🟢 queued' if os.path.exists('/tmp/next_run_triggered') else '⚪ not queued'}\n"
                       f"📈 Load: {' '.join(load)}  {stats}\n"
                       f"💽 Disk free: {du.free//(1024**3)} GB")
 
@@ -642,14 +835,24 @@ jobs:
               try: urllib.request.urlopen(req, timeout=15)
               except Exception: pass
 
-          def mark_watchdog_stop():
-              # Drive par STOP flag: Watchdog ko pata chalta hai ki user ne
-              # jaan-boojh kar band kiya hai, khud-ba-khud restart mat karo.
-              # Naya workflow start hote hi Step 2 is flag ko hata deta hai.
+          def cancel_run_id(rid):
               try:
-                  with open("/tmp/STOP_WORKFLOW.txt", "w") as f:
-                      f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
-                  sh("rclone copyto /tmp/STOP_WORKFLOW.txt gdrive:minecraft-control/STOP_WORKFLOW.txt --ignore-times", timeout=60)
+                  url = f"https://api.github.com/repos/{REPO}/actions/runs/{rid}/cancel"
+                  req = urllib.request.Request(url, method="POST")
+                  req.add_header("Authorization", f"token {GH_TOKEN}")
+                  req.add_header("Accept", "application/vnd.github+json")
+                  urllib.request.urlopen(req, timeout=15)
+              except Exception:
+                  pass
+
+          def cancel_standby():
+              # User khud workflow band kar raha hai — Guard ne jo standby
+              # run queue me lagaya tha use bhi cancel karo, warna ye
+              # session band hote hi wo khud start ho jayega.
+              try:
+                  rid = open("/tmp/standby_run_id").read().strip()
+                  if rid.isdigit():
+                      cancel_run_id(rid)
               except Exception:
                   pass
 
@@ -721,7 +924,7 @@ jobs:
                                   load = open("/proc/loadavg").read().split()[:3]
                                   du = shutil.disk_usage("/")
                                   send(f"📈 Load avg: {' '.join(load)}\n💽 Disk: {du.used//(1024**3)}/{du.total//(1024**3)} GB used\n" + sh("free -h | head -2"))
-                              elif cmd == "/panel": send(f"🎛️ Panel: http://{tailscale_ip()}:8080\n🌐 Minecraft join: {tailscale_ip()}:25565\n(Note: dono sirf aapke Tailscale wale devices se khulenge)")
+                              elif cmd == "/panel": send(f"🎛️ Panel (sirf Tailscale se khulega): http://{tailscale_ip()}:8080\n🔒 Private join: {tailscale_ip()}:25565\n🌐 Public join: Playit dashboard wala address — players ko Tailscale nahi chahiye")
                               elif cmd == "/startmc" or cmd == "/startserver": send(mc_power("start"))
                               elif cmd == "/stopserver": send(mc_power("stop"))
                               elif cmd == "/restartserver": send(mc_power("restart"))
@@ -760,12 +963,12 @@ jobs:
                               else: send("⚠️ System abhi ready nahi hai.")
                           elif data == "stopwf": stopwf_menu()
                           elif data == "backup_stop":
-                              mark_watchdog_stop()
+                              cancel_standby()
                               if write_action("backup_stop"): send("💾 Backup karke workflow band kar raha hoon...")
                               else:
                                   open("/tmp/stop_requested", "w").write("1"); cancel_workflow()
                           elif data == "stop_nobackup":
-                              mark_watchdog_stop()
+                              cancel_standby()
                               send(f"{now()} : 🛑 Bina backup workflow band ho raha hai. (LIVE backup Drive par hai)")
                               open("/tmp/stop_requested", "w").write("1")
                               open("/tmp/skip_final_backup", "w").write("1")
@@ -1190,6 +1393,26 @@ jobs:
           HANDOVER_CLOCK=$(date -d "@$HANDOVER_EPOCH" '+%I:%M %p' 2>/dev/null || echo "5h30m par")
           notify_telegram "🟢 Sir, Controller ACTIVE hai. FULL backup har 1h, LIVE backup har kuch seconds. SMART deadline ON: naya workflow pehle hi queue ho jayega aur lagbhag ${HANDOVER_CLOCK} par handover hoga (AUTO_RESTART=${AUTO_RESTART_NORM})."
 
+          # ---------- GUARD START (Main Loop ke saath) ----------
+          # Guard ko naye workflow ki settings chahiye — ek file me rakh do
+          {
+            printf 'WF_SERVER_MODE=%q\n' "${{ inputs.server_mode }}"
+            printf 'WF_MC_TYPE=%q\n' "${{ inputs.mc_type }}"
+            printf 'WF_MC_VERSION=%q\n' "${{ inputs.mc_version }}"
+            printf 'WF_MC_MEMORY=%q\n' "${{ inputs.mc_memory }}"
+            printf 'WF_OPS=%q\n' "${{ inputs.ops }}"
+          } > /tmp/workflow_inputs.env
+          # Sabse pehla kaam: dusra workflow STANDBY queue me lagao.
+          # Ye session error/timeout se kabhi bhi mare, queue wala run
+          # iske band hote hi turant start hoga.
+          if [ "$AUTO_RESTART_NORM" = "true" ]; then
+            notify_telegram "🛡️ Sir, GUARD start ho raha hai — pehle dusra workflow standby queue me laga raha hoon, phir har second sab par nazar rakhunga."
+            trigger_next_workflow || true
+          fi
+          tmux kill-session -t guard 2>/dev/null || true
+          tmux new-session -d -s guard '/usr/local/bin/mc_guard.sh >> /tmp/mc_guard.log 2>&1'
+          echo "Guard started in tmux session: guard"
+
           PREV_PLAYERS_FILE=/tmp/players_prev.txt; touch "$PREV_PLAYERS_FILE"
           POLL=0
           DEADLINE_WARNED=0
@@ -1232,6 +1455,7 @@ jobs:
                 trigger_next_workflow || true
               else
                 notify_telegram "⏳ Sir, session deadline aa gaya aur AUTO_RESTART off hai. Final backup karke band kar raha hoon."
+                /usr/local/bin/cancel_standby.sh || true
                 touch /tmp/stop_requested
               fi
               break
@@ -1364,12 +1588,13 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          # User-intentional stop hai to Watchdog ke liye STOP flag ek baar
-          # phir pakka kar do (bot wala upload agar kabhi fail hua ho).
+          # User-intentional stop hai to standby queue wala run bhi
+          # cancel karo — warna ye band hote hi wo khud start ho jayega.
+          # (Handover wale band me stop flag NAHI hota, standby chalega.)
           if [ -f /tmp/stop_requested ]; then
-            date '+%Y-%m-%d %H:%M:%S' > /tmp/STOP_WORKFLOW.txt
-            rclone copyto /tmp/STOP_WORKFLOW.txt "gdrive:minecraft-control/STOP_WORKFLOW.txt" --ignore-times > /dev/null 2>&1 || true
+            /usr/local/bin/cancel_standby.sh > /dev/null 2>&1 || true
           fi
+          tmux kill-session -t guard 2>/dev/null || true
           tmux kill-session -t tgbot 2>/dev/null || true
           tmux kill-session -t livebackup 2>/dev/null || true
           tmux kill-session -t wings 2>/dev/null || true
@@ -1386,106 +1611,9 @@ jobs:
           [ -f /tmp/next_run_triggered ] && MSG="♻️ Sir, purani session band — nayi session start ho chuki hai, 2-5 min me Minecraft wapas online hoga! 🎮"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ${MSG}" > /dev/null || true
 
-  # ==========================================================================
-  # JOB 2: WATCHDOG — sirf schedule (har 5 min) par chalega.
-  # Kaam: Minecraft wala run zinda hai to chup raho. Band pada ho aur user
-  # ne khud stop na kiya ho to ISI workflow ko dispatch karke naya
-  # Minecraft run start kar do. Manual Run par ye job skip rahega.
-  # ==========================================================================
-  watchdog:
-    name: 🛡️ Watchdog (Auto-Restart Check)
-    if: github.event_name == 'schedule'
-    concurrency:
-      group: minecraft-watchdog
-      cancel-in-progress: false
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: 🛡️ Minecraft zinda hai ya restart karu?
-        run: |
-          AUTO_NORM=$(echo "${AUTO_RESTART:-true}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-          [ -z "$AUTO_NORM" ] && AUTO_NORM="true"
-          if [ "$AUTO_NORM" != "true" ]; then
-            echo "AUTO_RESTART off hai ('${AUTO_RESTART}') — Watchdog kuch nahi karega."
-            exit 0
-          fi
+ndMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ${MSG}" > /dev/null || true
 
-          notify_telegram() {
-            [ -z "${TELEGRAM_BOT_TOKEN}" ] && return 0
-            NOW=$(date '+%I:%M:%S %p')
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=${NOW} : $1" > /dev/null || true
-          }
+t=${NOW} : ${MSG}" > /dev/null || true
 
-          fetch_runs() {
-            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?per_page=100" \
-              > /tmp/mc_runs.json 2>/dev/null
-          }
+ndMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ${MSG}" > /dev/null || true
 
-          # Schedule wale (Watchdog khud ke) runs ko ginna NAHI hai —
-          # sirf asli Minecraft (workflow_dispatch) runs dekho.
-          active_count() {
-            jq '[.workflow_runs[] | select(.event != "schedule") | select(.status != "completed")] | length' /tmp/mc_runs.json 2>/dev/null || echo 0
-          }
-
-          # ---- Check 1: koi Minecraft run chal/queue me hai? ----
-          if ! fetch_runs; then
-            echo "GitHub API se runs nahi mile, is baar skip."
-            exit 0
-          fi
-          ACTIVE=$(active_count)
-          echo "Active Minecraft runs: $ACTIVE"
-          if [ "${ACTIVE:-0}" -gt 0 ]; then
-            jq -r '.workflow_runs[] | select(.event != "schedule") | select(.status != "completed") | "  #\(.run_number) \(.status)"' /tmp/mc_runs.json
-            echo "Minecraft session zinda hai. Kuch nahi karna."
-            exit 0
-          fi
-
-          # Handover ke beech API kabhi purani haalat dikhata hai —
-          # galti se duplicate rokne ke liye 45 sec baad dobara pakka karo.
-          echo "Koi active Minecraft run nahi dikha. 45 sec ruk kar dobara check karta hoon..."
-          sleep 45
-          fetch_runs || exit 0
-          ACTIVE=$(active_count)
-          if [ "${ACTIVE:-0}" -gt 0 ]; then
-            echo "Dobara check me active run mil gaya. Sab sahi hai."
-            exit 0
-          fi
-
-          # ---- Check 2: aakhri Minecraft run khud Cancel to nahi tha? ----
-          LATEST_CONCLUSION=$(jq -r '[.workflow_runs[] | select(.event != "schedule") | select(.status=="completed")][0].conclusion // ""' /tmp/mc_runs.json)
-          echo "Aakhri Minecraft run ka conclusion: ${LATEST_CONCLUSION:-none}"
-          if [ "$LATEST_CONCLUSION" = "cancelled" ]; then
-            echo "Aakhri run Cancel hua tha — ye user ka faisla mana jayega, restart nahi hoga."
-            echo "Dobara chahiye to Actions se khud Run workflow kar do."
-            exit 0
-          fi
-
-          # ---- Check 3: Telegram se khud stop to nahi kiya? (Drive STOP flag) ----
-          echo "Drive par STOP flag check kar raha hoon..."
-          curl -fsSL https://rclone.org/install.sh | sudo bash > /dev/null 2>&1 || true
-          if rclone lsf "gdrive:minecraft-control" 2>/dev/null | grep -qx "STOP_WORKFLOW.txt"; then
-            echo "STOP flag mila — user ne khud band kiya hai. Restart NAHI hoga."
-            exit 0
-          fi
-
-          # ---- Sab clear: band pada hai, TURANT naya Minecraft run chalao ----
-          echo "Minecraft band pada hai. Naya run trigger kar raha hoon..."
-          if gh workflow run "${WORKFLOW_FILE}" --ref "${GITHUB_REF_NAME:-main}"; then
-            sleep 15
-            fetch_runs || true
-            ACTIVE=$(active_count)
-            echo "Trigger ke baad active Minecraft runs: ${ACTIVE:-0}"
-            if [ "${ACTIVE:-0}" -gt 0 ]; then
-              notify_telegram "🛡️ Sir, Watchdog ne dekha ki Minecraft workflow band pada tha (shayad GitHub timeout/infra error) — isliye NAYA workflow khud start kar diya hai. 3-6 min me server wapas online hoga. 🎮"
-              echo "Naya Minecraft run start ho gaya."
-            else
-              notify_telegram "⚠️ Sir, Watchdog ne naya workflow start karne ki koshish ki, lekin wo active nahi dikha. Actions page ek baar check kar lo."
-              echo "WARNING: trigger ke baad bhi active run nahi dikha."
-            fi
-          else
-            echo "ERROR: gh workflow run fail ho gaya."
-            notify_telegram "❌ Sir, Watchdog Minecraft workflow start NAHI kar paya. Actions ke is Watchdog run ke log check karo."
-            exit 1
-          fi
