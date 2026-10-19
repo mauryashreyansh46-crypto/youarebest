@@ -10,7 +10,11 @@ name: 🎮 Minecraft 24-7 Persistent Server (Pterodactyl + Telegram)
 #   Drive backup     -> 1) Hourly FULL backup (server band kiye bina)
 #                       2) LIVE backup (har change ~15-30 sec me Drive par)
 #                       3) Final emergency backup (timeout/error se pehle)
-#   Auto-restart     -> 5h30m par backup -> khud naya workflow start -> restore
+#   Auto-restart     -> Smart deadline: timeout se pehle backup + naya run queue
+#   Watchdog         -> ISI file ke andar dusra job. Har 5 min (schedule par)
+#                       check karta hai: Minecraft run band pada ho aur user
+#                       ne khud stop na kiya ho to naya run khud start.
+#                       Alag se koi dusri file NAHI chahiye.
 #
 # SABSE PEHLE README.md PADHO — Secrets aur first-run Panel steps wahi hain.
 # ============================================================================
@@ -42,10 +46,14 @@ on:
         description: "Server OP username(s), comma separated"
         required: true
         default: "RootBlastgaming"
+  # Watchdog isi file ke schedule se chalega. Schedule wale run me
+  # Minecraft wala job skip hoga, sirf Watchdog job chalega.
+  schedule:
+    - cron: "*/5 * * * *"
 
-concurrency:
-  group: minecraft-session
-  cancel-in-progress: false
+# NOTE: Yahan upar concurrency NAHI lagayi hai, warna schedule wala
+# Watchdog bhi Minecraft wale bade run ke peeche atak jayega. Concurrency
+# ab har job ke andar alag-alag hai (minecraft-session / minecraft-watchdog).
 
 permissions:
   actions: write
@@ -72,12 +80,21 @@ env:
   #     Variable nahi banaya to default TRUE mana jayega. ---
   AUTO_RESTART: ${{ vars.AUTO_RESTART }}
   GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
   TZ: Asia/Kolkata
   WORKFLOW_FILE: minecraft-server.yml
 
 jobs:
+  # ==========================================================================
+  # JOB 1: MINECRAFT SESSION — sirf tab chalega jab workflow manually ya
+  # API/Watchdog se dispatch ho. Schedule wale run me ye skip rahega.
+  # ==========================================================================
   minecraft:
     name: 🖥️ Minecraft Session
+    if: github.event_name == 'workflow_dispatch'
+    concurrency:
+      group: minecraft-session
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
@@ -121,8 +138,13 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ⚙️ Step 2 (Setup Tools): tmux, zstd, inotify-tools aur rclone install ho rahe hain..." > /dev/null || true
 
           sudo apt-get update -qq
-          sudo apt-get install -y -qq tmux python3 curl unzip net-tools neofetch iproute2 xxd jq util-linux zstd inotify-tools > /dev/null
+          sudo apt-get install -y -qq tmux python3 python3-yaml curl unzip net-tools neofetch iproute2 xxd jq util-linux zstd inotify-tools > /dev/null
           curl -fsSL https://rclone.org/install.sh | sudo bash
+
+          # Naya session sach me start ho raha hai, isliye Watchdog ke liye
+          # purana STOP flag hata do. User Telegram /stopwf karega to bot
+          # ye flag phir bana dega aur Watchdog dobara start nahi karega.
+          rclone deletefile "gdrive:minecraft-control/STOP_WORKFLOW.txt" > /dev/null 2>&1 || true
 
           # ---------- rclone progress uploader (purane code se, improved) ----------
           cat << 'EOF' | sudo tee /usr/local/bin/rclone_progress.sh >/dev/null
@@ -221,8 +243,18 @@ jobs:
                   pid, _ = recv()
                   if pid == -1: raise PermissionError("RCON password galat hai")
                   send(2, 2, command)           # command
-                  _, out = recv()
-                  return out.strip()
+                  resp_pid, out = recv()
+                  # Bada output kai packets me aata hai — bache hue bhi jodo.
+                  chunks = [out]
+                  s.settimeout(0.4)
+                  while True:
+                      try:
+                          next_pid, extra = recv()
+                      except Exception:
+                          break
+                      if next_pid != resp_pid: break
+                      chunks.append(extra)
+                  return "".join(chunks).strip()
 
           if __name__ == "__main__":
               import os
@@ -261,6 +293,47 @@ jobs:
           try:
               with open(PATH, "w") as f:
                   yaml.safe_dump(data, f, sort_keys=False)
+          except Exception:
+              sys.exit(0)
+          PYEOF
+
+          # ---------- server.properties RCON patch (password me special
+          # character ho to sed/grep tod deta tha, isliye pakka Python) ----------
+          cat << 'PYEOF' | sudo tee /usr/local/bin/patch_server_properties.py >/dev/null
+          #!/usr/bin/env python3
+          import os, sys
+          if len(sys.argv) < 2:
+              sys.exit(0)
+          PATH = sys.argv[1]
+          VALUES = {
+              "enable-rcon": "true",
+              "rcon.port": "25575",
+              "rcon.password": os.environ.get("MC_RCON_PASSWORD", ""),
+          }
+          try:
+              with open(PATH) as f:
+                  lines = f.read().splitlines()
+          except Exception:
+              sys.exit(0)
+          seen = set()
+          out = []
+          for line in lines:
+              stripped = line.strip()
+              if not stripped or stripped.startswith(("#", "!")) or "=" not in line:
+                  out.append(line)
+                  continue
+              key = line.split("=", 1)[0].strip()
+              if key in VALUES:
+                  out.append(key + "=" + VALUES[key])
+                  seen.add(key)
+              else:
+                  out.append(line)
+          for key, value in VALUES.items():
+              if key not in seen:
+                  out.append(key + "=" + value)
+          try:
+              with open(PATH, "w") as f:
+                  f.write("\n".join(out) + "\n")
           except Exception:
               sys.exit(0)
           PYEOF
@@ -314,11 +387,16 @@ jobs:
           if [ "$OK" = "1" ]; then
             notify_telegram "✅ Sir, backup ban gaya! Ab Google Drive par upload ho raha hai..."
             if /usr/local/bin/rclone_progress.sh "/tmp/minecraft-backup.tar.zst" "gdrive:minecraft-backup.tar.zst.tmp" "Uploading FULL Backup"; then
-              rclone moveto "gdrive:minecraft-backup.tar.zst.tmp" "gdrive:minecraft-backup.tar.zst" 2>/dev/null || true
-              rclone cleanup gdrive: 2>/dev/null || true
-              notify_telegram "🎉 Sir, FULL backup Drive par safe hai! (gdrive:minecraft-backup.tar.zst)"
-              touch /tmp/skip_final_backup
-              exit 0
+              # Rename bhi pakka hona chahiye — pehle rename fail hone par
+              # bhi "backup safe hai" bol diya jata tha. Aur 'rclone cleanup'
+              # poore Drive ka trash khali kar deta tha, wo hata diya hai.
+              if rclone moveto "gdrive:minecraft-backup.tar.zst.tmp" "gdrive:minecraft-backup.tar.zst" 2>/dev/null; then
+                notify_telegram "🎉 Sir, FULL backup Drive par safe hai! (gdrive:minecraft-backup.tar.zst)"
+                touch /tmp/skip_final_backup
+                exit 0
+              fi
+              notify_telegram "❌ Sir, backup upload hua lekin Drive par rename fail ho gaya. Ek baar /backup phir bhej do."
+              exit 1
             fi
           fi
           notify_telegram "❌ Sir, FULL backup me error aaya! Log: workflow ka 'Main Loop' step dekho."
@@ -370,12 +448,12 @@ jobs:
             # Naya Minecraft server volume mila? RCON on kar do (Telegram /cmd ke liye)
             DIR=$(mc_data_dir 2>/dev/null || true)
             if [ -n "$DIR" ] && [ -f "$DIR/server.properties" ]; then
-              if ! sudo grep -q "^rcon.password=${MC_RCON_PASSWORD}$" "$DIR/server.properties" 2>/dev/null; then
+              if ! sudo grep -Fqx "rcon.password=${MC_RCON_PASSWORD}" "$DIR/server.properties" 2>/dev/null; then
                 # FIX: Wings ke server files 'pterodactyl' user ke hote hain,
-                # bina sudo ke sed fail ho jata tha aur RCON on hi nahi hota tha.
-                sudo sed -i "s/^enable-rcon=.*/enable-rcon=true/" "$DIR/server.properties" 2>/dev/null || echo "enable-rcon=true" | sudo tee -a "$DIR/server.properties" >/dev/null
-                sudo grep -q "^rcon.port=" "$DIR/server.properties" && sudo sed -i "s/^rcon.port=.*/rcon.port=25575/" "$DIR/server.properties" || echo "rcon.port=25575" | sudo tee -a "$DIR/server.properties" >/dev/null
-                sudo grep -q "^rcon.password=" "$DIR/server.properties" && sudo sed -i "s|^rcon.password=.*|rcon.password=${MC_RCON_PASSWORD}|" "$DIR/server.properties" || echo "rcon.password=${MC_RCON_PASSWORD}" | sudo tee -a "$DIR/server.properties" >/dev/null
+                # bina sudo ke edit fail ho jata tha aur RCON on hi nahi hota
+                # tha. Python helper password ke special characters se bhi
+                # nahi tootta (purana sed toot jata tha).
+                sudo env MC_RCON_PASSWORD="$MC_RCON_PASSWORD" python3 /usr/local/bin/patch_server_properties.py "$DIR/server.properties" || true
                 if [ ! -f /tmp/rcon_notified ]; then
                   notify_telegram "🔌 Sir, server me RCON auto-enable ho gaya hai. Agar server chal raha tha to ek baar Panel/Telegram se RESTART kar do — phir /cmd kaam karega."
                   touch /tmp/rcon_notified
@@ -385,11 +463,22 @@ jobs:
               # sabse fresh world wapas bhar do (hourly backup se naya data)
               if [ ! -f /tmp/live_restored ] && rclone lsf "gdrive:minecraft-live-backup/current" >/dev/null 2>&1; then
                 C=$(mc_container 2>/dev/null || true)
-                [ -n "$C" ] && docker stop "$C" >/dev/null 2>&1 || true
+                WAS_RUNNING=0
+                if [ -n "$C" ] && [ "$(docker inspect -f '{{.State.Running}}' "$C" 2>/dev/null || echo false)" = "true" ]; then
+                  WAS_RUNNING=1
+                  docker stop "$C" >/dev/null 2>&1 || true
+                fi
                 rclone copy "gdrive:minecraft-live-backup/current" "$DIR" --update \
                   --exclude "logs/**" --exclude "cache/**" >> /tmp/live_sync.log 2>&1 || true
                 touch /tmp/live_restored
-                notify_telegram "♻️ Sir, LIVE backup se sabse fresh world restore ho gaya hai. Ab Panel/Telegram se server START kar do."
+                if [ "$WAS_RUNNING" = "1" ]; then
+                  # Restore ke liye roka tha, wapas chalu bhi kar do —
+                  # pehle server band pada reh jata tha.
+                  docker start "$C" >/dev/null 2>&1 || true
+                  notify_telegram "♻️ Sir, LIVE backup se sabse fresh world restore ho gaya aur server wapas START bhi kar diya hai."
+                else
+                  notify_telegram "♻️ Sir, LIVE backup se sabse fresh world restore ho gaya hai. Ab Panel/Telegram se server START kar do."
+                fi
               fi
             fi
             sleep 20
@@ -481,8 +570,17 @@ jobs:
                   pid, _ = recv()
                   if pid == -1: raise PermissionError("RCON password mismatch")
                   send(2, 2, command)
-                  _, out = recv()
-                  return out.strip() or "(koi output nahi)"
+                  resp_pid, out = recv()
+                  chunks = [out]
+                  s.settimeout(0.4)
+                  while True:
+                      try:
+                          next_pid, extra = recv()
+                      except Exception:
+                          break
+                      if next_pid != resp_pid: break
+                      chunks.append(extra)
+                  return "".join(chunks).strip() or "(koi output nahi)"
 
           def rcon_safe(cmd):
               try: return rcon(cmd)
@@ -515,8 +613,9 @@ jobs:
               return (f"📊 SERVER STATUS\n"
                       f"🖥️ Minecraft: {'🟢 ONLINE' if running else '🔴 OFFLINE'} (container: {c or 'not created'})\n"
                       f"👥 Players: {ptxt}\n"
-                      f"🌐 Join: {tailscale_ip()}:25565\n"
-                      f"🎛️ Panel: http://{tailscale_ip()}:8080\n"
+                      f"🌐 Public Join (Playit): Playit dashboard wala address (Tailscale nahi chahiye)\n"
+                      f"🔒 Private Join (Tailscale): {tailscale_ip()}:25565\n"
+                      f"🎛️ Panel (sirf Tailscale se): http://{tailscale_ip()}:8080\n"
                       f"⏱️ Session uptime: {session_uptime()} / ~5h30m\n"
                       f"📈 Load: {' '.join(load)}  {stats}\n"
                       f"💽 Disk free: {du.free//(1024**3)} GB")
@@ -542,6 +641,17 @@ jobs:
               req.add_header("Accept", "application/vnd.github+json")
               try: urllib.request.urlopen(req, timeout=15)
               except Exception: pass
+
+          def mark_watchdog_stop():
+              # Drive par STOP flag: Watchdog ko pata chalta hai ki user ne
+              # jaan-boojh kar band kiya hai, khud-ba-khud restart mat karo.
+              # Naya workflow start hote hi Step 2 is flag ko hata deta hai.
+              try:
+                  with open("/tmp/STOP_WORKFLOW.txt", "w") as f:
+                      f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+                  sh("rclone copyto /tmp/STOP_WORKFLOW.txt gdrive:minecraft-control/STOP_WORKFLOW.txt --ignore-times", timeout=60)
+              except Exception:
+                  pass
 
           def write_action(a):
               if os.path.exists("/tmp/main_loop_started"):
@@ -610,8 +720,6 @@ jobs:
                               elif cmd == "/load":
                                   load = open("/proc/loadavg").read().split()[:3]
                                   du = shutil.disk_usage("/")
-                                  send(f"📈 Load avgroc/loadavg").read().split()[:3]
-                                  du = shutil.disk_usage("/")
                                   send(f"📈 Load avg: {' '.join(load)}\n💽 Disk: {du.used//(1024**3)}/{du.total//(1024**3)} GB used\n" + sh("free -h | head -2"))
                               elif cmd == "/panel": send(f"🎛️ Panel: http://{tailscale_ip()}:8080\n🌐 Minecraft join: {tailscale_ip()}:25565\n(Note: dono sirf aapke Tailscale wale devices se khulenge)")
                               elif cmd == "/startmc" or cmd == "/startserver": send(mc_power("start"))
@@ -644,16 +752,20 @@ jobs:
                               n, mx, plist = players()
                               send(f"👥 Online: {n}/{mx}\n" + ("\n".join("• " + p for p in plist) if plist else "Koi online nahi.") if n is not None else rcon_safe("list"))
                           elif data == "panel": send(f"🎛️ Panel: http://{tailscale_ip()}:8080\n🌐 Join: {tailscale_ip()}:25565")
-                          elif data == "backup": send("💾 Backup queue me laga diya Sir..."); write_action("backup_now")
+                          elif data == "backup":
+                              if write_action("backup_now"): send("💾 Backup queue me laga diya Sir...")
+                              else: send("⚠️ Sir, system abhi ready nahi hai, thodi der baad phir dabao.")
                           elif data == "handover":
                               if write_action("handover"): send("♻️ Handover shuru: pehle safe backup, phir naya workflow auto-start hoga (2-5 min gap ayega).")
                               else: send("⚠️ System abhi ready nahi hai.")
                           elif data == "stopwf": stopwf_menu()
                           elif data == "backup_stop":
+                              mark_watchdog_stop()
                               if write_action("backup_stop"): send("💾 Backup karke workflow band kar raha hoon...")
                               else:
                                   open("/tmp/stop_requested", "w").write("1"); cancel_workflow()
                           elif data == "stop_nobackup":
+                              mark_watchdog_stop()
                               send(f"{now()} : 🛑 Bina backup workflow band ho raha hai. (LIVE backup Drive par hai)")
                               open("/tmp/stop_requested", "w").write("1")
                               open("/tmp/skip_final_backup", "w").write("1")
@@ -783,9 +895,7 @@ jobs:
               volumes:
                 - "/opt/pterodactyl/database:/var/lib/mysql"
               environment:
-                MYSQL_DATABASE: "panel"
-                MYSQL_USER: "pterodactyl"
-                MYSQL_PASSWORD: "${DB_PASSWORD}"
+                MYSQL_DATABASE: "pane}"
                 MYSQL_ROOT_PASSWORD: "${DB_ROOT_PASSWORD}"
             cache:
               image: redis:alpine
@@ -821,6 +931,12 @@ jobs:
                 DB_USERNAME: "pterodactyl"
                 DB_PASSWORD: "${DB_PASSWORD}"
                 HASHIDS_LENGTH: 8
+          networks:
+            default:
+              ipam:
+                config:
+                  - subnet: "172.20.0.0/16"
+                    gateway: "172.20.0.1"
           COMPOSEEOF
           # compose ko passwords .env se milenge
           sudo cp /tmp/panel.env /opt/pterodactyl/.env
@@ -860,7 +976,7 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🪽 Step 9: Wings daemon install ho raha hai..." > /dev/null || true
           sudo mkdir -p /etc/pterodactyl /var/lib/pterodactyl /var/log/pterodactyl
           if [ ! -x /usr/local/bin/wings ]; then
-            sudo curl -L -o /usr/local/bin/wings "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_$([[ "$(uname -m)" == "x86_64" ]] && echo "amd64" || echo "arm64")"
+            sudo curl -fL -o /usr/local/bin/wings "https://github.com/pterodactyl/wings/releases/download/v1.13.4/wings_linux_$([[ "$(uname -m)" == "x86_64" ]] && echo "amd64" || echo "arm64")"
             sudo chmod u+x /usr/local/bin/wings
           fi
           # Watcher: config milte hi Wings start, server milte hi RCON on
@@ -937,7 +1053,9 @@ jobs:
           NOW=$(date '+%I:%M:%S %p')
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : 🌍 Step: Playit agent start ho raha hai (players ke public join ke liye). Panel aapka Tailscale par hi rahega, bilkul safe." > /dev/null || true
           docker rm -f playit-agent 2>/dev/null || true
-          docker pull ghcr.io/playit-cloud/playit-agent:1.0
+          # Playit sirf public join ke liye hai — iska pull fail ho jaye to
+          # poora Minecraft session NAHI rukna chahiye.
+          docker pull ghcr.io/playit-cloud/playit-agent:1.0 || true
           if docker run -d --name playit-agent --restart unless-stopped --net=host -e SECRET_KEY="${PLAYIT_SECRET_KEY}" ghcr.io/playit-cloud/playit-agent:1.0; then
             sleep 12
             if [ "$(docker inspect -f '{{.State.Running}}' playit-agent 2>/dev/null || echo false)" = "true" ]; then
@@ -972,42 +1090,148 @@ jobs:
       - name: 🔄 Main Loop (Hourly Backup + 24/7 Handover + Events)
         run: |
           touch /tmp/main_loop_started
-          date +%s > /tmp/session_start_epoch
+          # /tmp/session_start_epoch Step 1 me JOB ki asal shuruaat par banta
+          # hai. Use overwrite MAT karo — deadline hamesha job-start se gini
+          # jayegi, warna setup me lage time se handover late ho jata tha.
           source /usr/local/bin/mc_common.sh
 
           trigger_next_workflow() {
-            if [ -f /tmp/next_run_triggered ]; then return 0; fi
-            curl -s -X POST \
-              -H "Authorization: token ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
-              -d "{\"ref\":\"${GITHUB_REF_NAME}\"}" > /dev/null || true
-            touch /tmp/next_run_triggered
+            if [ -f /tmp/next_run_triggered ]; then
+              echo "Next workflow pehle hi successfully trigger ho chuka hai."
+              return 0
+            fi
+
+            # Current run ki settings naye run ko bhi bhejo, taaki mode/version
+            # handover ke baad badal na jaye.
+            WF_SERVER_MODE="${{ inputs.server_mode }}"
+            WF_MC_TYPE="${{ inputs.mc_type }}"
+            WF_MC_VERSION="${{ inputs.mc_version }}"
+            WF_MC_MEMORY="${{ inputs.mc_memory }}"
+            WF_OPS="${{ inputs.ops }}"
+            [ -z "$WF_SERVER_MODE" ] && WF_SERVER_MODE="pterodactyl"
+            [ -z "$WF_MC_TYPE" ] && WF_MC_TYPE="PAPER"
+            [ -z "$WF_MC_VERSION" ] && WF_MC_VERSION="LATEST"
+            [ -z "$WF_MC_MEMORY" ] && WF_MC_MEMORY="5G"
+            [ -z "$WF_OPS" ] && WF_OPS="RootBlastgaming"
+
+            PAYLOAD=$(jq -n \
+              --arg ref "${GITHUB_REF_NAME:-main}" \
+              --arg server_mode "$WF_SERVER_MODE" \
+              --arg mc_type "$WF_MC_TYPE" \
+              --arg mc_version "$WF_MC_VERSION" \
+              --arg mc_memory "$WF_MC_MEMORY" \
+              --arg ops "$WF_OPS" \
+              '{ref:$ref, inputs:{server_mode:$server_mode, mc_type:$mc_type, mc_version:$mc_version, mc_memory:$mc_memory, ops:$ops}}')
+
+            # GitHub sirf HTTP 204 par workflow-dispatch accept karta hai.
+            # Pehle code bina status check kiye "triggered" maan leta tha —
+            # wahi is chain tootne ki sabse badi wajah thi.
+            for ATTEMPT in 1 2 3; do
+              HTTP_CODE=$(curl -sS --connect-timeout 10 --max-time 30 -o /tmp/workflow_dispatch_response.txt -w "%{http_code}" -X POST \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+                -d "$PAYLOAD") || HTTP_CODE="000"
+              echo "Workflow dispatch attempt ${ATTEMPT}: HTTP ${HTTP_CODE}"
+              if [ "$HTTP_CODE" = "204" ]; then
+                touch /tmp/next_run_triggered
+                notify_telegram "✅ Sir, GitHub ne NAYA workflow accept kar liya hai (HTTP 204). Ye session band hote hi naya run khud start hoga."
+                return 0
+              fi
+              echo "GitHub response:"
+              cat /tmp/workflow_dispatch_response.txt 2>/dev/null || true
+              sleep 20
+            done
+
+            # REST API na mane to GitHub CLI se ek last koshish.
+            if command -v gh >/dev/null 2>&1; then
+              if gh workflow run "${WORKFLOW_FILE}" --ref "${GITHUB_REF_NAME:-main}" \
+                -f server_mode="$WF_SERVER_MODE" \
+                -f mc_type="$WF_MC_TYPE" \
+                -f mc_version="$WF_MC_VERSION" \
+                -f mc_memory="$WF_MC_MEMORY" \
+                -f ops="$WF_OPS"; then
+                touch /tmp/next_run_triggered
+                notify_telegram "✅ Sir, GitHub CLI se NAYA workflow trigger ho gaya hai. Ye session band hote hi naya run start hoga."
+                return 0
+              fi
+            fi
+
+            notify_telegram "❌ Sir, NAYA workflow GitHub ne accept NAHI kiya. Backup bilkul safe hai. Is run ke 'Main Loop' step ke aakhir me HTTP code dikhega — uska screenshot bhejo, wahi se asli karan milega."
+            return 1
           }
 
-          START_TIME=$(date +%s)
-          TOTAL_SECONDS=19800        # 5h30m : phir handover (job hard-limit 6h hai)
-          BACKUP_INTERVAL=3600       # har 1 ghanta FULL backup
-          LAST_BACKUP_TIME=$START_TIME
-          AUTO_RESTART_NORM=$(echo "${AUTO_RESTART:-true}" | tr '[:upper:]' '[:lower:]')
+          # ---------- SMART DEADLINE (job ki asal shuruaat se) ----------
+          # GitHub ka timeout kabhi 5:35, kabhi 6:00 par padta hai, isliye
+          # loop-start se 5:30 ginna khatarnak tha (setup ka time jud jata).
+          # Ab hisaab JOB ki asal shuruaat se hoga:
+          #   job-start + 5h10 (310m) : NAYA workflow trigger (queue ho jayega)
+          #   job-start + 5h30 (330m) : final backup -> ye run band
+          #   job timeout khud 350m par hai, upar se GitHub hard-limit 360m —
+          #   dono se pehle hum nikal jayenge, 20-30 min ka pura buffer.
+          LOOP_START_TIME=$(date +%s)
+          JOB_START_EPOCH=$(cat /tmp/session_start_epoch 2>/dev/null || echo "")
+          case "$JOB_START_EPOCH" in
+            ''|*[!0-9]*) JOB_START_EPOCH=$LOOP_START_TIME ;;
+          esac
+          if [ "$JOB_START_EPOCH" -gt "$LOOP_START_TIME" ] || [ "$JOB_START_EPOCH" -lt $((LOOP_START_TIME - 21600)) ]; then
+            JOB_START_EPOCH=$LOOP_START_TIME
+          fi
+          PRETRIGGER_SECONDS=18600     # job-start + 5h10 : doosra workflow queue
+          HANDOVER_SECONDS=19800       # job-start + 5h30 : backup karke band
+          PRETRIGGER_EPOCH=$((JOB_START_EPOCH + PRETRIGGER_SECONDS))
+          HANDOVER_EPOCH=$((JOB_START_EPOCH + HANDOVER_SECONDS))
+          BACKUP_INTERVAL=3600         # har 1 ghanta FULL backup
+          LAST_BACKUP_TIME=$LOOP_START_TIME
+          AUTO_RESTART_NORM=$(echo "${AUTO_RESTART:-true}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+          [ -z "$AUTO_RESTART_NORM" ] && AUTO_RESTART_NORM="true"
 
-          notify_telegram "🟢 Sir, Controller ACTIVE hai. FULL backup har 1h, LIVE backup har kuch seconds, auto-handover 5h30m par (AUTO_RESTART=${AUTO_RESTART_NORM})."
+          HANDOVER_CLOCK=$(date -d "@$HANDOVER_EPOCH" '+%I:%M %p' 2>/dev/null || echo "5h30m par")
+          notify_telegram "🟢 Sir, Controller ACTIVE hai. FULL backup har 1h, LIVE backup har kuch seconds. SMART deadline ON: naya workflow pehle hi queue ho jayega aur lagbhag ${HANDOVER_CLOCK} par handover hoga (AUTO_RESTART=${AUTO_RESTART_NORM})."
 
           PREV_PLAYERS_FILE=/tmp/players_prev.txt; touch "$PREV_PLAYERS_FILE"
           POLL=0
+          DEADLINE_WARNED=0
+          PRETRIGGER_LAST_TRY=0
           while true; do
             sleep 5
             NOW_S=$(date +%s)
-            ELAPSED=$((NOW_S - START_TIME))
+            REMAINING_TO_HANDOVER=$((HANDOVER_EPOCH - NOW_S))
 
-            # ---- 5h30m ho gaya: backup -> naya workflow -> band ----
-            if [ "$ELAPSED" -ge "$TOTAL_SECONDS" ]; then
+            # ---- Timeout se 30 min pehle warning + safety backup ----
+            if [ "$AUTO_RESTART_NORM" = "true" ] && [ "$REMAINING_TO_HANDOVER" -le 1800 ] && [ "$DEADLINE_WARNED" = "0" ]; then
+              notify_telegram "⏰ Sir, dhyaan do — is session ka timeout lagbhag $((REMAINING_TO_HANDOVER / 60)) minute me aane wala hai. System pehle se naya workflow queue karke backup ki taiyari kar raha hai."
+              DEADLINE_WARNED=1
+              # Agar purana backup der se hua hai to abhi ek safety backup
+              # le lo — GitHub beech me hi runner maar de to bhi world safe.
+              if [ $((NOW_S - LAST_BACKUP_TIME)) -ge 1800 ]; then
+                /usr/local/bin/mc_backup.sh "Pre-Deadline Safety Backup" || true
+                LAST_BACKUP_TIME=$(date +%s); rm -f /tmp/skip_final_backup
+                NOW_S=$(date +%s)
+              fi
+            fi
+
+            # ---- Timeout se ~20 min pehle: doosra workflow TURANT queue ----
+            # Naya run concurrency ki wajah se pending rahega. Jaise hi ye run
+            # backup karke band hoga, GitHub use turant utha lega — timeout
+            # ka intezaar karke bhejne se hamesha der hoti thi.
+            if [ "$AUTO_RESTART_NORM" = "true" ] && [ "$NOW_S" -ge "$PRETRIGGER_EPOCH" ] && [ ! -f /tmp/next_run_triggered ]; then
+              if [ "$PRETRIGGER_LAST_TRY" = "0" ] || [ $((NOW_S - PRETRIGGER_LAST_TRY)) -ge 120 ]; then
+                PRETRIGGER_LAST_TRY=$NOW_S
+                notify_telegram "🚀 Sir, timeout nazdeek hai — doosra workflow ABHI GitHub me queue kar raha hoon, taaki ye band hote hi wo turant start ho."
+                trigger_next_workflow || true
+              fi
+            fi
+
+            # ---- Deadline aa gayi: final backup -> band ----
+            if [ "$NOW_S" -ge "$HANDOVER_EPOCH" ]; then
               if [ "$AUTO_RESTART_NORM" = "true" ]; then
-                notify_telegram "♻️ Sir, 5h30m pure! Safe backup karke NAYA workflow khud start kar raha hoon. Minecraft 2-5 min me wapas online hoga (1-2 sec possible nahi hota, GitHub runner banne me time lagta hai)."
-                /usr/local/bin/mc_backup.sh "Auto Handover (5h30m)" || true
-                trigger_next_workflow
+                notify_telegram "♻️ Sir, smart deadline aa gayi! Safe backup karke band kar raha hoon — naya workflow pehle se queue me hai aur turant start hoga. Minecraft 2-5 min me wapas online hoga (runner banne me GitHub ko ye time lagta hi hai)."
+                /usr/local/bin/mc_backup.sh "Auto Handover (Smart Deadline)" || true
+                trigger_next_workflow || true
               else
-                notify_telegram "⏳ Sir, session limit aa gaya aur AUTO_RESTART off hai. Final backup karke band kar raha hoon."
+                notify_telegram "⏳ Sir, session deadline aa gaya aur AUTO_RESTART off hai. Final backup karke band kar raha hoon."
                 touch /tmp/stop_requested
               fi
               break
@@ -1075,19 +1299,63 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          AUTO_NORM=$(echo "${AUTO_RESTART:-true}" | tr '[:upper:]' '[:lower:]')
-          if [ "$AUTO_NORM" != "true" ]; then echo "AUTO_RESTART off hai."; exit 0; fi
+          AUTO_NORM=$(echo "${AUTO_RESTART:-true}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+          [ -z "$AUTO_NORM" ] && AUTO_NORM="true"
+          if [ "$AUTO_NORM" != "true" ]; then echo "AUTO_RESTART off hai: '${AUTO_RESTART}'"; exit 0; fi
           if [ -f /tmp/stop_requested ]; then echo "User ne stop manga tha, restart nahi hoga."; exit 0; fi
-          if [ -f /tmp/next_run_triggered ]; then echo "Naya workflow pehle hi start kar diya hai."; exit 0; fi
+          if [ -f /tmp/next_run_triggered ]; then echo "Naya workflow pehle hi successfully start kar diya hai."; exit 0; fi
           if [ ! -f /tmp/main_loop_started ]; then echo "Session thik se start hi nahi hui thi, restart skip (loop rokne ke liye)."; exit 0; fi
           NOW=$(date '+%I:%M:%S %p')
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ♻️ Sir, session khatam/error hua — 24/7 mode me naya workflow KHUD start kar raha hoon. 2-5 min me server wapas hoga." > /dev/null || true
-          curl -s -X POST \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
-            -d "{\"ref\":\"${GITHUB_REF_NAME}\"}" > /dev/null || true
-          touch /tmp/next_run_triggered
+
+          WF_SERVER_MODE="${{ inputs.server_mode }}"
+          WF_MC_TYPE="${{ inputs.mc_type }}"
+          WF_MC_VERSION="${{ inputs.mc_version }}"
+          WF_MC_MEMORY="${{ inputs.mc_memory }}"
+          WF_OPS="${{ inputs.ops }}"
+          [ -z "$WF_SERVER_MODE" ] && WF_SERVER_MODE="pterodactyl"
+          [ -z "$WF_MC_TYPE" ] && WF_MC_TYPE="PAPER"
+          [ -z "$WF_MC_VERSION" ] && WF_MC_VERSION="LATEST"
+          [ -z "$WF_MC_MEMORY" ] && WF_MC_MEMORY="5G"
+          [ -z "$WF_OPS" ] && WF_OPS="RootBlastgaming"
+          PAYLOAD=$(jq -n \
+            --arg ref "${GITHUB_REF_NAME:-main}" \
+            --arg server_mode "$WF_SERVER_MODE" \
+            --arg mc_type "$WF_MC_TYPE" \
+            --arg mc_version "$WF_MC_VERSION" \
+            --arg mc_memory "$WF_MC_MEMORY" \
+            --arg ops "$WF_OPS" \
+            '{ref:$ref, inputs:{server_mode:$server_mode, mc_type:$mc_type, mc_version:$mc_version, mc_memory:$mc_memory, ops:$ops}}')
+
+          DISPATCH_OK=0
+          for ATTEMPT in 1 2 3; do
+            HTTP_CODE=$(curl -sS --connect-timeout 10 --max-time 30 -o /tmp/workflow_dispatch_response.txt -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+              -d "$PAYLOAD") || HTTP_CODE="000"
+            echo "Auto-restart dispatch attempt ${ATTEMPT}: HTTP ${HTTP_CODE}"
+            if [ "$HTTP_CODE" = "204" ]; then DISPATCH_OK=1; break; fi
+            cat /tmp/workflow_dispatch_response.txt 2>/dev/null || true
+            sleep 20
+          done
+          if [ "$DISPATCH_OK" != "1" ] && command -v gh >/dev/null 2>&1; then
+            gh workflow run "${WORKFLOW_FILE}" --ref "${GITHUB_REF_NAME:-main}" \
+              -f server_mode="$WF_SERVER_MODE" \
+              -f mc_type="$WF_MC_TYPE" \
+              -f mc_version="$WF_MC_VERSION" \
+              -f mc_memory="$WF_MC_MEMORY" \
+              -f ops="$WF_OPS" && DISPATCH_OK=1 || true
+          fi
+          if [ "$DISPATCH_OK" = "1" ]; then
+            touch /tmp/next_run_triggered
+            echo "Next workflow successfully triggered."
+          else
+            echo "ERROR: GitHub ne next workflow accept nahi kiya. Upar wala HTTP code asli karan hai."
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ❌ Sir, auto-restart GitHub ne accept nahi kiya. Is run ke 'Auto-Restart Next Workflow' step ka HTTP code screenshot bhejo. Backup safe hai." > /dev/null || true
+          fi
 
       # ============================================================
       # STEP 15: CLEAN SHUTDOWN
@@ -1096,13 +1364,128 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
+          # User-intentional stop hai to Watchdog ke liye STOP flag ek baar
+          # phir pakka kar do (bot wala upload agar kabhi fail hua ho).
+          if [ -f /tmp/stop_requested ]; then
+            date '+%Y-%m-%d %H:%M:%S' > /tmp/STOP_WORKFLOW.txt
+            rclone copyto /tmp/STOP_WORKFLOW.txt "gdrive:minecraft-control/STOP_WORKFLOW.txt" --ignore-times > /dev/null 2>&1 || true
+          fi
           tmux kill-session -t tgbot 2>/dev/null || true
           tmux kill-session -t livebackup 2>/dev/null || true
           tmux kill-session -t wings 2>/dev/null || true
-          C=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^minecraft$' || true)
-          [ -n "$C" ] && timeout 60 docker stop minecraft >/dev/null 2>&1 || true
+          # Minecraft chahe direct mode ka ho (naam: minecraft) ya Wings ka
+          # (naam: server UUID) — dono ko saaf band karo. Pehle sirf
+          # 'minecraft' naam wala rukta tha, Wings wala reh jata tha.
+          [ -f /usr/local/bin/mc_common.sh ] && source /usr/local/bin/mc_common.sh || true
+          C=$(mc_container 2>/dev/null || true)
+          [ -z "$C" ] && C=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^minecraft$' || true)
+          [ -n "$C" ] && timeout 60 docker stop "$C" >/dev/null 2>&1 || true
           timeout 20 docker stop playit-agent >/dev/null 2>&1 || true
           NOW=$(date '+%I:%M:%S %p')
           MSG="✅ Sir, session saaf band ho gaya. Phir milenge! 🙏"
           [ -f /tmp/next_run_triggered ] && MSG="♻️ Sir, purani session band — nayi session start ho chuki hai, 2-5 min me Minecraft wapas online hoga! 🎮"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d chat_id="${TELEGRAM_CHAT_ID}" --data-urlencode "text=${NOW} : ${MSG}" > /dev/null || true
+
+  # ==========================================================================
+  # JOB 2: WATCHDOG — sirf schedule (har 5 min) par chalega.
+  # Kaam: Minecraft wala run zinda hai to chup raho. Band pada ho aur user
+  # ne khud stop na kiya ho to ISI workflow ko dispatch karke naya
+  # Minecraft run start kar do. Manual Run par ye job skip rahega.
+  # ==========================================================================
+  watchdog:
+    name: 🛡️ Watchdog (Auto-Restart Check)
+    if: github.event_name == 'schedule'
+    concurrency:
+      group: minecraft-watchdog
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 🛡️ Minecraft zinda hai ya restart karu?
+        run: |
+          AUTO_NORM=$(echo "${AUTO_RESTART:-true}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+          [ -z "$AUTO_NORM" ] && AUTO_NORM="true"
+          if [ "$AUTO_NORM" != "true" ]; then
+            echo "AUTO_RESTART off hai ('${AUTO_RESTART}') — Watchdog kuch nahi karega."
+            exit 0
+          fi
+
+          notify_telegram() {
+            [ -z "${TELEGRAM_BOT_TOKEN}" ] && return 0
+            NOW=$(date '+%I:%M:%S %p')
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${NOW} : $1" > /dev/null || true
+          }
+
+          fetch_runs() {
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?per_page=100" \
+              > /tmp/mc_runs.json 2>/dev/null
+          }
+
+          # Schedule wale (Watchdog khud ke) runs ko ginna NAHI hai —
+          # sirf asli Minecraft (workflow_dispatch) runs dekho.
+          active_count() {
+            jq '[.workflow_runs[] | select(.event != "schedule") | select(.status != "completed")] | length' /tmp/mc_runs.json 2>/dev/null || echo 0
+          }
+
+          # ---- Check 1: koi Minecraft run chal/queue me hai? ----
+          if ! fetch_runs; then
+            echo "GitHub API se runs nahi mile, is baar skip."
+            exit 0
+          fi
+          ACTIVE=$(active_count)
+          echo "Active Minecraft runs: $ACTIVE"
+          if [ "${ACTIVE:-0}" -gt 0 ]; then
+            jq -r '.workflow_runs[] | select(.event != "schedule") | select(.status != "completed") | "  #\(.run_number) \(.status)"' /tmp/mc_runs.json
+            echo "Minecraft session zinda hai. Kuch nahi karna."
+            exit 0
+          fi
+
+          # Handover ke beech API kabhi purani haalat dikhata hai —
+          # galti se duplicate rokne ke liye 45 sec baad dobara pakka karo.
+          echo "Koi active Minecraft run nahi dikha. 45 sec ruk kar dobara check karta hoon..."
+          sleep 45
+          fetch_runs || exit 0
+          ACTIVE=$(active_count)
+          if [ "${ACTIVE:-0}" -gt 0 ]; then
+            echo "Dobara check me active run mil gaya. Sab sahi hai."
+            exit 0
+          fi
+
+          # ---- Check 2: aakhri Minecraft run khud Cancel to nahi tha? ----
+          LATEST_CONCLUSION=$(jq -r '[.workflow_runs[] | select(.event != "schedule") | select(.status=="completed")][0].conclusion // ""' /tmp/mc_runs.json)
+          echo "Aakhri Minecraft run ka conclusion: ${LATEST_CONCLUSION:-none}"
+          if [ "$LATEST_CONCLUSION" = "cancelled" ]; then
+            echo "Aakhri run Cancel hua tha — ye user ka faisla mana jayega, restart nahi hoga."
+            echo "Dobara chahiye to Actions se khud Run workflow kar do."
+            exit 0
+          fi
+
+          # ---- Check 3: Telegram se khud stop to nahi kiya? (Drive STOP flag) ----
+          echo "Drive par STOP flag check kar raha hoon..."
+          curl -fsSL https://rclone.org/install.sh | sudo bash > /dev/null 2>&1 || true
+          if rclone lsf "gdrive:minecraft-control" 2>/dev/null | grep -qx "STOP_WORKFLOW.txt"; then
+            echo "STOP flag mila — user ne khud band kiya hai. Restart NAHI hoga."
+            exit 0
+          fi
+
+          # ---- Sab clear: band pada hai, TURANT naya Minecraft run chalao ----
+          echo "Minecraft band pada hai. Naya run trigger kar raha hoon..."
+          if gh workflow run "${WORKFLOW_FILE}" --ref "${GITHUB_REF_NAME:-main}"; then
+            sleep 15
+            fetch_runs || true
+            ACTIVE=$(active_count)
+            echo "Trigger ke baad active Minecraft runs: ${ACTIVE:-0}"
+            if [ "${ACTIVE:-0}" -gt 0 ]; then
+              notify_telegram "🛡️ Sir, Watchdog ne dekha ki Minecraft workflow band pada tha (shayad GitHub timeout/infra error) — isliye NAYA workflow khud start kar diya hai. 3-6 min me server wapas online hoga. 🎮"
+              echo "Naya Minecraft run start ho gaya."
+            else
+              notify_telegram "⚠️ Sir, Watchdog ne naya workflow start karne ki koshish ki, lekin wo active nahi dikha. Actions page ek baar check kar lo."
+              echo "WARNING: trigger ke baad bhi active run nahi dikha."
+            fi
+          else
+            echo "ERROR: gh workflow run fail ho gaya."
+            notify_telegram "❌ Sir, Watchdog Minecraft workflow start NAHI kar paya. Actions ke is Watchdog run ke log check karo."
+            exit 1
+          fi
